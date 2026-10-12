@@ -1,35 +1,35 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
-    fmt,
+    fmt, fs,
     path::{Component, Path, PathBuf},
 };
 
-use crate::{CleanupProfile, ProjectMode};
+use crate::CleanupProfile;
 use serde::Deserialize;
 
-const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub struct Config {
     default_profile: CleanupProfile,
-    projects: BTreeMap<String, RegisteredProject>,
+    profiles: BTreeMap<CleanupProfile, Vec<Category>>,
     additional_keep_paths: Vec<PathBuf>,
 }
 
-#[derive(Debug)]
-pub struct RegisteredProject {
-    path: PathBuf,
-    mode: ProjectMode,
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Category {
+    RustTarget,
+    NixStoreGc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
     InvalidToml,
     UnsupportedSchemaVersion,
-    InvalidProjectName,
-    InvalidProjectPath,
-    OverlappingProjectRoots,
     InvalidKeepPath,
 }
 
@@ -38,17 +38,15 @@ pub enum ConfigError {
 struct RawConfig {
     schema_version: u32,
     default_profile: CleanupProfile,
-    #[serde(default)]
-    projects: BTreeMap<String, RawProject>,
+    profiles: BTreeMap<CleanupProfile, RawProfile>,
     #[serde(default)]
     additional_keep_paths: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawProject {
-    path: PathBuf,
-    mode: ProjectMode,
+struct RawProfile {
+    categories: Vec<Category>,
 }
 
 impl Config {
@@ -59,37 +57,20 @@ impl Config {
             return Err(ConfigError::UnsupportedSchemaVersion);
         }
 
-        let mut projects: BTreeMap<String, RegisteredProject> = BTreeMap::new();
+        if raw.profiles.values().any(|settings| {
+            let unique_categories = settings.categories.iter().collect::<BTreeSet<_>>();
+            unique_categories.len() != settings.categories.len()
+        }) {
+            return Err(ConfigError::InvalidToml);
+        }
 
-        for (name, project) in raw.projects {
-            if !valid_project_name(&name) {
-                return Err(ConfigError::InvalidProjectName);
-            }
-
-            if !valid_absolute_path(&project.path)
-                || !project
-                    .path
-                    .components()
-                    .any(|component| matches!(component, Component::Normal(_)))
-            {
-                return Err(ConfigError::InvalidProjectPath);
-            }
-
-            let path = normalize_path(&project.path);
-
-            if projects.values().any(|existing| {
-                path.starts_with(&existing.path) || existing.path.starts_with(&path)
-            }) {
-                return Err(ConfigError::OverlappingProjectRoots);
-            }
-
-            projects.insert(
-                name,
-                RegisteredProject {
-                    path,
-                    mode: project.mode,
-                },
-            );
+        let profiles = raw
+            .profiles
+            .into_iter()
+            .map(|(profile, settings)| (profile, settings.categories))
+            .collect::<BTreeMap<_, _>>();
+        if profiles.len() != 3 {
+            return Err(ConfigError::InvalidToml);
         }
 
         let additional_keep_paths = raw
@@ -105,7 +86,7 @@ impl Config {
 
         Ok(Self {
             default_profile: raw.default_profile,
-            projects,
+            profiles,
             additional_keep_paths,
         })
     }
@@ -114,12 +95,8 @@ impl Config {
         self.default_profile
     }
 
-    pub fn project(&self, name: &str) -> Option<&RegisteredProject> {
-        self.projects.get(name)
-    }
-
-    pub fn projects(&self) -> &BTreeMap<String, RegisteredProject> {
-        &self.projects
+    pub fn categories(&self, profile: CleanupProfile) -> &[Category] {
+        self.profiles.get(&profile).map_or(&[], Vec::as_slice)
     }
 
     pub fn additional_keep_paths(&self) -> &[PathBuf] {
@@ -130,14 +107,19 @@ impl Config {
             .iter()
             .any(|keep_path| candidate.starts_with(keep_path) || keep_path.starts_with(candidate))
     }
-}
 
-impl RegisteredProject {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-    pub fn mode(&self) -> ProjectMode {
-        self.mode
+    /// Conservatively compare a validated candidate with keep paths, following aliases only
+    /// while resolving configured keep paths. An unresolvable keep path protects the candidate.
+    pub fn overlaps_resolved_keep_path(&self, candidate: &Path) -> bool {
+        self.additional_keep_paths.iter().any(|keep_path| {
+            if candidate.starts_with(keep_path) || keep_path.starts_with(candidate) {
+                return true;
+            }
+            let Some(resolved_keep) = resolve_keep_path(keep_path) else {
+                return true;
+            };
+            candidate.starts_with(&resolved_keep) || resolved_keep.starts_with(candidate)
+        })
     }
 }
 
@@ -146,9 +128,6 @@ impl fmt::Display for ConfigError {
         let message = match self {
             Self::InvalidToml => "configuration has invalid syntax, fields or enum values",
             Self::UnsupportedSchemaVersion => "unsupported configuration schema version",
-            Self::InvalidProjectName => "invalid project name",
-            Self::InvalidProjectPath => "invalid project path",
-            Self::OverlappingProjectRoots => "registered project roots overlap",
             Self::InvalidKeepPath => "invalid additional keep path",
         };
 
@@ -157,13 +136,6 @@ impl fmt::Display for ConfigError {
 }
 
 impl Error for ConfigError {}
-
-fn valid_project_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
-}
 
 fn valid_absolute_path(path: &Path) -> bool {
     path.is_absolute()
@@ -178,4 +150,28 @@ fn valid_absolute_path(path: &Path) -> bool {
 
 fn normalize_path(path: &Path) -> PathBuf {
     path.components().collect()
+}
+
+fn resolve_keep_path(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                if !missing.is_empty() && !metadata.is_dir() {
+                    return None;
+                }
+                let mut resolved = fs::canonicalize(ancestor).ok()?;
+                for component in missing.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
 }
