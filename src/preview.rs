@@ -261,12 +261,22 @@ fn preview_with_runner(
             decision_for(project.mode(), profile, false),
         );
     }
-    let Some(canonical_target) = valid_target(&root, &target) else {
+    let Some(target_state) = validated_target(&root, &target) else {
         return preview(
             project_name,
             DiscoveryOutcome::Unsupported,
             decision_for(project.mode(), profile, false),
         );
+    };
+    let canonical_target = match target_state {
+        TargetValidation::Missing => {
+            return preview(
+                project_name,
+                DiscoveryOutcome::NoTarget,
+                decision_for(project.mode(), profile, false),
+            );
+        }
+        TargetValidation::Present(path) => path,
     };
     if config.overlaps_resolved_keep_path(&canonical_target) {
         return preview(
@@ -320,27 +330,45 @@ fn valid_manifest(root: &Path) -> Option<PathBuf> {
     Some(path)
 }
 
-fn valid_target(root: &Path, target: &Path) -> Option<PathBuf> {
-    let metadata = fs::symlink_metadata(target).ok()?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+enum TargetValidation {
+    Present(PathBuf),
+    Missing,
+}
+
+fn validated_target(root: &Path, target: &Path) -> Option<TargetValidation> {
+    let relative = target.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
         return None;
     }
+
+    let mut current = root.to_path_buf();
+    let mut missing = false;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if !missing => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return None;
+                }
+            }
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+            Err(_) => return None,
+        }
+    }
+
+    if missing {
+        return Some(TargetValidation::Missing);
+    }
+
     let canonical = fs::canonicalize(target).ok()?;
     if canonical == root || !canonical.starts_with(root) {
         return None;
     }
-    let mut current = target;
-    while current != root {
-        let entry = fs::symlink_metadata(current).ok()?;
-        if entry.file_type().is_symlink() {
-            return None;
-        }
-        current = current.parent()?;
-        if !current.starts_with(root) {
-            return None;
-        }
-    }
-    Some(canonical)
+    Some(TargetValidation::Present(canonical))
 }
 
 fn run_cargo_metadata(manifest: &Path) -> Result<Vec<u8>, ()> {
@@ -371,20 +399,16 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    struct Fixture(PathBuf);
+    struct Fixture(tempfile::TempDir);
     impl Fixture {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "hule-provider-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(tempfile::tempdir().unwrap())
+        }
+        fn path(&self) -> &Path {
+            self.0.path()
         }
         fn project(&self, target: &str) -> (Config, ProjectRegistry) {
-            let root = self.0.join("project with spaces");
+            let root = self.path().join("project with spaces");
             fs::create_dir_all(root.join(target)).unwrap();
             fs::write(
                 root.join("Cargo.toml"),
@@ -397,11 +421,6 @@ mod tests {
                 .register("fixture".into(), root.clone(), ProjectMode::Ephemeral)
                 .unwrap();
             (config(true, vec![]), registry)
-        }
-    }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
         }
     }
     fn config(enabled: bool, keep: Vec<&str>) -> Config {
@@ -420,7 +439,7 @@ mod tests {
         let fixture = Fixture::new();
         let (_base_config, registry) = fixture.project("build/nested");
         let target = registry.get("fixture").unwrap().path().join("build/nested");
-        let alias = fixture.0.join("target-alias");
+        let alias = fixture.path().join("target-alias");
         symlink(&target, &alias).unwrap();
         let config = config(true, vec![alias.to_str().unwrap()]);
         let result = preview_with_runner(
@@ -443,7 +462,7 @@ mod tests {
         let (_base_config, registry) = fixture.project("build/nested");
         let root = registry.get("fixture").unwrap().path();
         let target = root.join("build/nested");
-        let alias = fixture.0.join("build-alias");
+        let alias = fixture.path().join("build-alias");
         symlink(root.join("build"), &alias).unwrap();
         let keep = alias.join("nested/keep");
         let config = config(true, vec![keep.to_str().unwrap()]);
@@ -471,6 +490,46 @@ mod tests {
             |_| Ok(metadata(&target)),
         );
         assert_eq!(result.target_path(), Some(target.as_path()));
+    }
+
+    #[test]
+    fn reports_verified_absent_nested_target_without_authorizing_cleanup() {
+        let fixture = Fixture::new();
+        let (config, registry) = fixture.project("build");
+        let root = registry.get("fixture").unwrap().path();
+        let target = root.join("build/nested/target");
+        assert!(!target.exists());
+
+        let result = preview_with_runner(
+            &config,
+            &registry,
+            "fixture",
+            CleanupProfile::Normal,
+            |_| Ok(metadata(&target)),
+        );
+        assert_eq!(result.outcome(), &DiscoveryOutcome::NoTarget);
+        assert_eq!(result.target_path(), None);
+        assert_eq!(result.decision(), RetentionDecision::Eligible);
+
+        let report = crate::report::render_rust_target_preview(&result);
+        assert!(report.contains("target: -\n"));
+        assert!(report.contains("discovery: no-target/no-artifacts\n"));
+        assert!(!report.contains(target.to_str().unwrap()));
+
+        let plan = preview_plan_with_runner(
+            &config,
+            &registry,
+            RustTargetSelection::Named("fixture".into()),
+            CleanupProfile::Normal,
+            |_| Ok(metadata(&target)),
+        );
+        let json = serde_json::to_value(plan).unwrap();
+        assert_eq!(json["authorization"], "not_authorized");
+        assert_eq!(
+            json["entries"][0]["discovery"],
+            serde_json::json!({"outcome": "no_target"})
+        );
+        assert_eq!(json["entries"][0]["decision"], "eligible");
     }
 
     #[test]
@@ -530,7 +589,7 @@ mod tests {
         let fixture = Fixture::new();
         let (config, registry) = fixture.project("target");
         let root = registry.get("fixture").unwrap().path().to_path_buf();
-        let outside = fixture.0.join("outside");
+        let outside = fixture.path().join("outside");
         fs::create_dir(&outside).unwrap();
         let external = preview_with_runner(
             &config,
@@ -557,7 +616,25 @@ mod tests {
             CleanupProfile::Normal,
             |_| Ok(metadata(&absent)),
         );
-        assert_eq!(missing_target.outcome(), &DiscoveryOutcome::Unsupported);
+        assert_eq!(missing_target.outcome(), &DiscoveryOutcome::NoTarget);
+        let root_target = preview_with_runner(
+            &config,
+            &registry,
+            "fixture",
+            CleanupProfile::Normal,
+            |_| Ok(metadata(&root)),
+        );
+        assert_eq!(root_target.outcome(), &DiscoveryOutcome::Unsupported);
+        let blocked = root.join("blocked");
+        fs::write(&blocked, "fixture obstruction").unwrap();
+        let obstructed_target = preview_with_runner(
+            &config,
+            &registry,
+            "fixture",
+            CleanupProfile::Normal,
+            |_| Ok(metadata(&blocked.join("target"))),
+        );
+        assert_eq!(obstructed_target.outcome(), &DiscoveryOutcome::Unsupported);
         let bad = preview_with_runner(
             &config,
             &registry,
@@ -578,6 +655,29 @@ mod tests {
                 |_| Ok(metadata(&link)),
             );
             assert_eq!(symlink.outcome(), &DiscoveryOutcome::Unsupported);
+            let linked_ancestor = root.join("linked-ancestor");
+            std::os::unix::fs::symlink(&outside, &linked_ancestor).unwrap();
+            let missing_below_symlink = preview_with_runner(
+                &config,
+                &registry,
+                "fixture",
+                CleanupProfile::Normal,
+                |_| Ok(metadata(&linked_ancestor.join("not-created"))),
+            );
+            assert_eq!(
+                missing_below_symlink.outcome(),
+                &DiscoveryOutcome::Unsupported
+            );
+            let broken_link = root.join("broken-link");
+            std::os::unix::fs::symlink(outside.join("not-created"), &broken_link).unwrap();
+            let broken_symlink = preview_with_runner(
+                &config,
+                &registry,
+                "fixture",
+                CleanupProfile::Normal,
+                |_| Ok(metadata(&broken_link)),
+            );
+            assert_eq!(broken_symlink.outcome(), &DiscoveryOutcome::Unsupported);
         }
     }
 
