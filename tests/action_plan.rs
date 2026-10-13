@@ -1,6 +1,8 @@
 use hule::{
     CleanupProfile,
-    action_plan::{NixStoreActionPlan, StoreIdentity, read_plan, write_new},
+    action_plan::{
+        ActionPlan, NixStoreActionPlan, StoreIdentity, read_action_plan, read_plan, write_new,
+    },
     config::Category,
 };
 use std::{fs, path::PathBuf};
@@ -30,6 +32,10 @@ fn strict_plan_roundtrips_and_file_is_create_new() {
     let p = plan(d.path());
     write_new(&path, &p).unwrap();
     assert_eq!(read_plan(&path).unwrap(), p);
+    assert_eq!(
+        read_action_plan(&path).unwrap(),
+        ActionPlan::NixStore(p.clone())
+    );
     assert!(write_new(&path, &p).is_err());
     #[cfg(unix)]
     {

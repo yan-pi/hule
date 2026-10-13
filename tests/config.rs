@@ -1,6 +1,6 @@
 use hule::{
     CleanupProfile,
-    config::{Category, Config, ConfigError},
+    config::{Category, Config, ConfigError, NixProfileConfig},
 };
 use std::path::Path;
 
@@ -227,6 +227,100 @@ fn detects_overlaps_with_additional_keep_paths() {
 fn no_keep_path_means_no_configurated_overla() {
     let config = parse_config(BASE).expect("valid fixture");
     assert!(!config.overlaps_keep_path(Path::new("/work/demo/target")));
+}
+
+#[test]
+fn generation_categories_are_independently_opt_in_and_old_configs_default_empty() {
+    let config = Config::from_toml(
+        r#"schema_version = 2
+default_profile = "normal"
+[profiles.low]
+categories = []
+[profiles.normal]
+categories = ["nix_user_generations"]
+[profiles.aggressive]
+categories = ["nix_home_manager_generations"]
+"#,
+    )
+    .expect("valid generation policy");
+    assert!(
+        config
+            .categories(CleanupProfile::Normal)
+            .contains(&Category::NixUserGenerations)
+    );
+    assert!(
+        !config
+            .categories(CleanupProfile::Normal)
+            .contains(&Category::NixHomeManagerGenerations)
+    );
+    assert!(
+        config
+            .categories(CleanupProfile::Aggressive)
+            .contains(&Category::NixHomeManagerGenerations)
+    );
+    assert!(config.nix_profiles().is_empty());
+
+    let old = parse_config(BASE).expect("old schema-v2 policy remains valid");
+    assert!(old.nix_profiles().is_empty());
+}
+
+#[test]
+fn parses_strict_named_user_and_home_manager_profiles() {
+    let config = Config::from_toml(
+        r#"schema_version = 2
+default_profile = "normal"
+[profiles.low]
+categories = []
+[profiles.normal]
+categories = []
+[profiles.aggressive]
+categories = []
+[nix_profiles.user]
+kind = "user"
+path = "/Users/alex/.local/state/nix/profiles/profile"
+[nix_profiles.hm]
+kind = "home_manager"
+path = "/Users/alex/.local/state/nix/profiles/home-manager"
+current_home_roots = ["/Users/alex/.local/share/home-manager/gcroots/current-home"]
+"#,
+    )
+    .expect("valid named profiles");
+    assert!(matches!(
+        config.nix_profiles().get("user"),
+        Some(NixProfileConfig::User { path }) if path == Path::new("/Users/alex/.local/state/nix/profiles/profile")
+    ));
+    assert!(matches!(
+        config.nix_profiles().get("hm"),
+        Some(NixProfileConfig::HomeManager { current_home_roots, .. }) if current_home_roots == &[Path::new("/Users/alex/.local/share/home-manager/gcroots/current-home").to_path_buf()]
+    ));
+}
+
+#[test]
+fn rejects_invalid_profile_names_and_kind_specific_fields() {
+    let base = r#"schema_version = 2
+default_profile = "normal"
+[profiles.low]
+categories = []
+[profiles.normal]
+categories = []
+[profiles.aggressive]
+categories = []
+"#;
+    let invalid_name = format!(
+        "{base}\n[nix_profiles.\"../bad\"]\nkind = \"user\"\npath = \"/Users/alex/.local/state/nix/profiles/profile\"\n"
+    );
+    assert_eq!(
+        Config::from_toml(&invalid_name).unwrap_err(),
+        ConfigError::InvalidNixProfileName
+    );
+
+    let invalid_user = format!(
+        "{base}\n[nix_profiles.user]\nkind = \"user\"\npath = \"/Users/alex/.local/state/nix/profiles/profile\"\ncurrent_home_roots = []\n"
+    );
+    assert_eq!(
+        Config::from_toml(&invalid_user).unwrap_err(),
+        ConfigError::InvalidToml
+    );
 }
 
 #[test]

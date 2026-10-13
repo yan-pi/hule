@@ -1,7 +1,8 @@
 use hule::{
     CleanupProfile,
-    action_plan::{read_plan, write_new},
+    action_plan::{ActionPlan, read_action_plan, write_generation_new, write_new},
     config::Config,
+    nix_generations::{self, CommandGenerationRunner, GenerationError, GenerationStatus},
     nix_store::{self, CommandNixRunner},
     preset::Preset,
     preview::{RustTargetSelection, preview_rust_target, preview_rust_target_plan},
@@ -15,7 +16,7 @@ use std::{
     path::PathBuf,
 };
 
-const HELP: &str = "Usage:\n  hule --help\n  hule --version\n  hule config preset NAME\n  hule plan nix-store --config PATH --store-path PATH... --output PLAN [--profile low|normal|aggressive]\n  hule apply --plan PATH --config PATH [--profile low|normal|aggressive]\n  hule project register --name NAME --path PATH --mode persistent|ephemeral [--state PATH]\n  hule project list [--state PATH]\n  hule project unregister --name NAME [--state PATH]\n  hule preview rust-target --config PATH (--project NAME | --all) [--state PATH] [--profile low|normal|aggressive] [--json]\n\nFor Rust-target preview Cargo metadata (`cargo metadata --no-deps --offline --locked`) may be invoked only when each project is registered, rust_target is enabled for the selected profile, and the anticipated target is not already protected. Cargo documentation does not formally guarantee absence of all side effects or code execution. Nix store planning queries requisites for explicitly named objects and can open/create/migrate store metadata. Apply requires an interactive confirmation and uses only the saved closure with nix-store --delete --store daemon; Nix performs native liveness checks and may refuse or partially complete. No broad GC or direct filesystem removal is performed.\n";
+const HELP: &str = "Usage:\n  hule --help\n  hule --version\n  hule config preset NAME\n  hule plan nix-store --config PATH --store-path PATH... --output PLAN [--profile low|normal|aggressive]\n  hule plan nix-generations --config PATH --nix-profile NAME --generation ID... --output PLAN [--profile low|normal|aggressive]\n  hule apply --plan PATH --config PATH [--profile low|normal|aggressive]\n  hule project register --name NAME --path PATH --mode persistent|ephemeral [--state PATH]\n  hule project list [--state PATH]\n  hule project unregister --name NAME [--state PATH]\n  hule preview rust-target --config PATH (--project NAME | --all) [--state PATH] [--profile low|normal|aggressive] [--json]\n\nFor Rust-target preview Cargo metadata (`cargo metadata --no-deps --offline --locked`) may be invoked only when each project is registered, rust_target is enabled for the selected profile, and the anticipated target is not already protected. Cargo documentation does not formally guarantee absence of all side effects or code execution. Nix store planning queries requisites for explicitly named objects and can open/create/migrate store metadata. Apply requires an interactive confirmation and uses only the saved closure with nix-store --delete --store daemon; Nix performs native liveness checks and may refuse or partially complete. Generation planning accepts only exact numeric IDs from one configured user profile; apply removes only saved noncurrent profile links through nix-env --delete-generations. Generation apply does not activate generations, delete store objects, or run GC. Native profile locking protects the generation current at the command's locked check, but does not make the saved snapshot atomic against concurrent writers. No broad GC or direct filesystem removal is performed.\n";
 
 fn main() {
     if let Err(error) = run(std::env::args().skip(1).collect()) {
@@ -41,6 +42,9 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         [flag] if flag == "--help" => print!("{HELP}"),
         [command, subcommand, ..] if command == "plan" && subcommand == "nix-store" => {
             run_nix_plan(&args[2..])?;
+        }
+        [command, subcommand, ..] if command == "plan" && subcommand == "nix-generations" => {
+            run_nix_generation_plan(&args[2..])?;
         }
         [command, ..] if command == "apply" => run_apply(&args[1..])?,
         [command, subcommand, name] if command == "config" && subcommand == "preset" => {
@@ -248,6 +252,97 @@ fn parse_nix_plan(args: &[String]) -> Result<ParsedNixPlan, Box<dyn Error>> {
         profile,
     })
 }
+struct ParsedNixGenerationPlan {
+    config: PathBuf,
+    output: PathBuf,
+    nix_profile: String,
+    generation_ids: Vec<u32>,
+    profile: Option<CleanupProfile>,
+}
+
+fn run_nix_generation_plan(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let parsed = parse_nix_generation_plan(args)?;
+    let config = Config::from_toml(&fs::read_to_string(&parsed.config)?)?;
+    let cleanup_profile = parsed.profile.unwrap_or_else(|| config.default_profile());
+    let mut runner = CommandGenerationRunner::default();
+    let plan = nix_generations::create_plan(
+        &mut runner,
+        &config,
+        cleanup_profile,
+        &parsed.nix_profile,
+        &parsed.generation_ids,
+    )?;
+    write_generation_new(&parsed.output, &plan)?;
+    println!(
+        "Planned {} explicit Nix generation IDs from profile {}; only rollback links are selected, store objects are retained, and no activation or GC is performed.",
+        plan.selected_ids.len(),
+        escape(&plan.nix_profile),
+    );
+    for id in &plan.selected_ids {
+        if let Some(generation) = plan.history.iter().find(|item| item.id == *id) {
+            println!(
+                "generation {id}: link {} -> {}",
+                escape(&generation.link.to_string_lossy()),
+                escape(&generation.target.to_string_lossy())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_nix_generation_plan(args: &[String]) -> Result<ParsedNixGenerationPlan, Box<dyn Error>> {
+    let (mut config, mut output, mut nix_profile, mut profile) = (None, None, None, None);
+    let mut generation_ids = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args.get(index + 1).ok_or("missing value")?;
+        match flag {
+            "--config" if config.is_none() => config = Some(PathBuf::from(value)),
+            "--output" if output.is_none() => output = Some(PathBuf::from(value)),
+            "--nix-profile" if nix_profile.is_none() => nix_profile = Some(value.clone()),
+            "--profile" if profile.is_none() => profile = Some(parse_profile(value)?),
+            "--generation" => {
+                let id = parse_generation_id(value)?;
+                if generation_ids.contains(&id) {
+                    return Err("duplicate generation id".into());
+                }
+                if generation_ids.len() >= nix_generations::MAX_GENERATION_IDS {
+                    return Err("too many generations selected".into());
+                }
+                generation_ids.push(id);
+            }
+            _ => return Err("invalid arguments; use --help for usage".into()),
+        }
+        index += 2;
+    }
+    if generation_ids.is_empty() {
+        return Err("at least one --generation is required".into());
+    }
+    generation_ids.sort_unstable();
+    Ok(ParsedNixGenerationPlan {
+        config: config.ok_or("missing --config")?,
+        output: output.ok_or("missing --output")?,
+        nix_profile: nix_profile.ok_or("missing --nix-profile")?,
+        generation_ids,
+        profile,
+    })
+}
+
+fn parse_generation_id(value: &str) -> Result<u32, Box<dyn Error>> {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("invalid generation id".into());
+    }
+    let id = value.parse::<u32>().map_err(|_| "invalid generation id")?;
+    if id == 0 || id > i32::MAX as u32 {
+        return Err("invalid generation id".into());
+    }
+    Ok(id)
+}
+
 fn parse_profile(value: &str) -> Result<CleanupProfile, Box<dyn Error>> {
     Ok(match value {
         "low" => CleanupProfile::Low,
@@ -273,10 +368,21 @@ fn run_apply(args: &[String]) -> Result<(), Box<dyn Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(nix_store::NixError::NonInteractive.into());
     }
-    let plan = read_plan(&plan_path.ok_or("missing --plan")?)?;
+    let action = read_action_plan(&plan_path.ok_or("missing --plan")?)?;
     let config_path = config_path.ok_or("missing --config")?;
+    match action {
+        ActionPlan::NixStore(plan) => run_apply_nix_store(&config_path, profile, plan),
+        ActionPlan::NixGenerations(plan) => run_apply_nix_generations(&config_path, profile, plan),
+    }
+}
+
+fn run_apply_nix_store(
+    config_path: &std::path::Path,
+    profile: Option<CleanupProfile>,
+    plan: hule::action_plan::NixStoreActionPlan,
+) -> Result<(), Box<dyn Error>> {
     let load = || -> Result<Config, Box<dyn Error>> {
-        Ok(Config::from_toml(&fs::read_to_string(&config_path)?)?)
+        Ok(Config::from_toml(&fs::read_to_string(config_path)?)?)
     };
     let config = load()?;
     let selected = profile.unwrap_or_else(|| config.default_profile());
@@ -285,8 +391,8 @@ fn run_apply(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!(
         "Nix store delete will request these exact objects (Nix may reject live paths; GC bookkeeping may change; operation may be partial and is not atomic):"
     );
-    for p in &plan.closure {
-        println!("{}", escape(&p.to_string_lossy()));
+    for path in &plan.closure {
+        println!("{}", escape(&path.to_string_lossy()));
     }
     let confirmation = nix_confirmation(&plan.closure);
     print!("Type {confirmation} to continue: ");
@@ -315,6 +421,73 @@ fn run_apply(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
     println!("Nix delete command completed; no reclaimed-size or atomicity claim is made.");
     Ok(())
+}
+
+fn run_apply_nix_generations(
+    config_path: &std::path::Path,
+    profile: Option<CleanupProfile>,
+    plan: hule::action_plan::NixGenerationActionPlan,
+) -> Result<(), Box<dyn Error>> {
+    let load = || -> Result<Config, Box<dyn Error>> {
+        Ok(Config::from_toml(&fs::read_to_string(config_path)?)?)
+    };
+    let config = load()?;
+    let selected = profile.unwrap_or_else(|| config.default_profile());
+    let mut runner = CommandGenerationRunner::default();
+    nix_generations::revalidate(&mut runner, &config, selected, &plan)?;
+    println!(
+        "Only these noncurrent rollback links are selected. Store objects remain; no Home Manager/nix-darwin activation, store-object deletion, or GC is performed. Concurrent profile/history writers or Home Manager activation are not serialized by Hule."
+    );
+    for id in &plan.selected_ids {
+        if let Some(generation) = plan.history.iter().find(|item| item.id == *id) {
+            println!(
+                "generation {id}: {}",
+                escape(&generation.link.to_string_lossy())
+            );
+        }
+    }
+    let confirmation = nix_generation_confirmation(&plan)?;
+    print!("Type {confirmation} to continue: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer)? == 0 || answer.trim() != confirmation {
+        return Err(GenerationError::Declined.into());
+    }
+    let fresh = load()?;
+    let fresh_profile = profile.unwrap_or_else(|| fresh.default_profile());
+    let result = nix_generations::apply(&mut runner, &fresh, fresh_profile, &plan, |_| Ok(true))?;
+    for item in &result.statuses {
+        let status = match item.status {
+            GenerationStatus::Removed => "removed",
+            GenerationStatus::RetainedOrNotDeleted => "retained_or_not_deleted",
+            GenerationStatus::AbsentAfterFailure => "absent_after_failure",
+            GenerationStatus::Unknown => "unknown",
+        };
+        println!("generation {}: {status}", item.id);
+    }
+    if !result.command_succeeded || !result.is_complete() {
+        return Err(GenerationError::Incomplete.into());
+    }
+    println!(
+        "Selected generation links were removed; store objects remain. No reclaimed-size or atomicity claim is made."
+    );
+    Ok(())
+}
+
+fn nix_generation_confirmation(
+    plan: &hule::action_plan::NixGenerationActionPlan,
+) -> Result<String, Box<dyn Error>> {
+    let bytes = serde_json::to_vec(plan).map_err(|_| "could not bind confirmation")?;
+    let hash = bytes
+        .into_iter()
+        .fold(0xcbf29ce484222325u64, |mut hash, byte| {
+            hash ^= u64::from(byte);
+            hash.wrapping_mul(0x100000001b3)
+        });
+    Ok(format!(
+        "PRUNE-GENERATIONS {} {hash:016x}",
+        plan.selected_ids.len()
+    ))
 }
 
 fn nix_confirmation(paths: &[PathBuf]) -> String {

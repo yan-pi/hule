@@ -544,6 +544,8 @@ fn help_and_version_are_supported() {
     assert!(help.status.success());
     let help_text = String::from_utf8_lossy(&help.stdout);
     assert!(help_text.contains("preview rust-target"));
+    assert!(help_text.contains("plan nix-generations"));
+    assert!(help_text.contains("--nix-profile NAME --generation ID"));
     assert!(help_text.contains(
         "Cargo metadata (`cargo metadata --no-deps --offline --locked`) may be invoked only when each project is registered"
     ));
@@ -562,6 +564,62 @@ fn help_and_version_are_supported() {
             .trim(),
         format!("hule {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn generation_cli_rejects_noncanonical_ids_and_endpoint_injection_before_loading_config() {
+    for id in ["0", "01", "+1", "-1", "all", "30d", "2147483648", "--store"] {
+        let output = invoke(&[
+            "plan",
+            "nix-generations",
+            "--config",
+            "/definitely/not/a/real/config.toml",
+            "--nix-profile",
+            "hm",
+            "--generation",
+            id,
+            "--output",
+            "/tmp/hule-invalid-generation-plan.json",
+        ]);
+        assert!(!output.status.success(), "accepted id: {id}");
+        assert_eq!(output.stderr, b"hule: invalid generation id\n", "id: {id}");
+    }
+}
+
+#[test]
+fn generation_cli_rejects_duplicate_and_excessive_ids() {
+    let duplicate = invoke(&[
+        "plan",
+        "nix-generations",
+        "--config",
+        "/missing",
+        "--nix-profile",
+        "hm",
+        "--generation",
+        "1",
+        "--generation",
+        "1",
+        "--output",
+        "/tmp/plan.json",
+    ]);
+    assert_eq!(duplicate.stderr, b"hule: duplicate generation id\n");
+
+    let mut args = vec![
+        "plan".to_string(),
+        "nix-generations".to_string(),
+        "--config".to_string(),
+        "/missing".to_string(),
+        "--nix-profile".to_string(),
+        "hm".to_string(),
+    ];
+    for id in 1..=33 {
+        args.push("--generation".into());
+        args.push(id.to_string());
+    }
+    args.extend(["--output".into(), "/tmp/plan.json".into()]);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let excessive = invoke(&refs);
+    assert_eq!(excessive.stderr, b"hule: too many generations selected\n");
 }
 
 #[test]
