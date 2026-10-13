@@ -27,6 +27,7 @@ pub enum Category {
     NixStoreGc,
     NixUserGenerations,
     NixHomeManagerGenerations,
+    DockerPurge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -110,6 +111,9 @@ impl Config {
         if raw.profiles.values().any(|settings| {
             let unique_categories = settings.categories.iter().collect::<BTreeSet<_>>();
             unique_categories.len() != settings.categories.len()
+        }) || raw.profiles.iter().any(|(profile, settings)| {
+            *profile != CleanupProfile::Aggressive
+                && settings.categories.contains(&Category::DockerPurge)
         }) {
             return Err(ConfigError::InvalidToml);
         }

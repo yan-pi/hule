@@ -1,7 +1,11 @@
 use hule::{
     CleanupProfile,
-    action_plan::{ActionPlan, read_action_plan, write_generation_new, write_new},
+    action_plan::{
+        ActionPlan, DockerPurgeActionPlan, read_action_plan, validate_docker_purge_location,
+        write_docker_purge_new, write_generation_new, write_new,
+    },
     config::Config,
+    docker_purge::{self, CommandDockerPurgeRunner, DockerPurgeError},
     nix_generations::{self, CommandGenerationRunner, GenerationError, GenerationStatus},
     nix_store::{self, CommandNixRunner},
     preset::Preset,
@@ -16,7 +20,7 @@ use std::{
     path::PathBuf,
 };
 
-const HELP: &str = "Usage:\n  hule --help\n  hule --version\n  hule config preset NAME\n  hule plan nix-store --config PATH --store-path PATH... --output PLAN [--profile low|normal|aggressive]\n  hule plan nix-generations --config PATH --nix-profile NAME --generation ID... --output PLAN [--profile low|normal|aggressive]\n  hule apply --plan PATH --config PATH [--profile low|normal|aggressive]\n  hule project register --name NAME --path PATH --mode persistent|ephemeral [--state PATH]\n  hule project list [--state PATH]\n  hule project unregister --name NAME [--state PATH]\n  hule preview rust-target --config PATH (--project NAME | --all) [--state PATH] [--profile low|normal|aggressive] [--json]\n\nFor Rust-target preview Cargo metadata (`cargo metadata --no-deps --offline --locked`) may be invoked only when each project is registered, rust_target is enabled for the selected profile, and the anticipated target is not already protected. Cargo documentation does not formally guarantee absence of all side effects or code execution. Nix store planning queries requisites for explicitly named objects and can open/create/migrate store metadata. Apply requires an interactive confirmation and uses only the saved closure with nix-store --delete --store daemon; Nix performs native liveness checks and may refuse or partially complete. Generation planning accepts only exact numeric IDs from one configured user profile; apply removes only saved noncurrent profile links through nix-env --delete-generations. Generation apply does not activate generations, delete store objects, or run GC. Native profile locking protects the generation current at the command's locked check, but does not make the saved snapshot atomic against concurrent writers. No broad GC or direct filesystem removal is performed.\n";
+const HELP: &str = "Usage:\n  hule --help\n  hule --version\n  hule config preset NAME\n  hule plan nix-store --config PATH --store-path PATH... --output PLAN [--profile low|normal|aggressive]\n  hule plan nix-generations --config PATH --nix-profile NAME --generation ID... --output PLAN [--profile low|normal|aggressive]\n  hule plan docker --docker-purge --config PATH --docker-cli /ABS/PATH/docker --docker-endpoint unix:///PATH --output PLAN [--profile low|normal|aggressive]\n  hule apply --plan PATH --config PATH [--profile low|normal|aggressive]\n  hule project register --name NAME --path PATH --mode persistent|ephemeral [--state PATH]\n  hule project list [--state PATH]\n  hule project unregister --name NAME [--state PATH]\n  hule preview rust-target --config PATH (--project NAME | --all) [--state PATH] [--profile low|normal|aggressive] [--json]\n\nFor Rust-target preview Cargo metadata (`cargo metadata --no-deps --offline --locked`) may be invoked only when each project is registered, rust_target is enabled for the selected profile, and the anticipated target is not already protected. Cargo documentation does not formally guarantee absence of all side effects or code execution. Nix store planning queries requisites for explicitly named objects and can open/create/migrate store metadata. Apply requires an interactive confirmation and uses only the saved closure with nix-store --delete --store daemon; Nix performs native liveness checks and may refuse or partially complete. Generation planning accepts only exact numeric IDs from one configured user profile; apply removes only saved noncurrent profile links through nix-env --delete-generations. Generation apply does not activate generations, delete store objects, or run GC. Native profile locking protects the generation current at the command's locked check, but does not make the saved snapshot atomic against concurrent writers. No broad GC or direct filesystem removal is performed. Docker purge planning requires an explicit --docker-purge flag, the aggressive profile with docker_purge enabled, an explicitly selected trusted Docker CLI path, and a verified local Unix socket with protected parent directories; it records executable/socket/directory identities, Engine ID, and CLI/Engine/API versions and requires API 1.42 or newer. Apply requires a typed interactive confirmation and revalidates those identities immediately before running only docker system prune --all --volumes --force. The daemon dynamically selects stopped containers, unused networks, all unused images, build cache, and unused anonymous volumes at execution; no per-resource preview or rollback is possible. Errors may follow partial mutation; Hule makes no retry and reports unknown outcome.\n";
 
 fn main() {
     if let Err(error) = run(std::env::args().skip(1).collect()) {
@@ -45,6 +49,9 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         }
         [command, subcommand, ..] if command == "plan" && subcommand == "nix-generations" => {
             run_nix_generation_plan(&args[2..])?;
+        }
+        [command, subcommand, ..] if command == "plan" && subcommand == "docker" => {
+            run_docker_purge_plan(&args[2..])?;
         }
         [command, ..] if command == "apply" => run_apply(&args[1..])?,
         [command, subcommand, name] if command == "config" && subcommand == "preset" => {
@@ -260,6 +267,80 @@ struct ParsedNixGenerationPlan {
     profile: Option<CleanupProfile>,
 }
 
+struct ParsedDockerPurgePlan {
+    config: PathBuf,
+    docker_cli: PathBuf,
+    endpoint: String,
+    output: PathBuf,
+    profile: Option<CleanupProfile>,
+}
+
+fn run_docker_purge_plan(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let parsed = parse_docker_purge_plan(args)?;
+    let config = Config::from_toml(&fs::read_to_string(&parsed.config)?)?;
+    let profile = parsed.profile.unwrap_or_else(|| config.default_profile());
+    let mut runner = CommandDockerPurgeRunner;
+    let plan = docker_purge::create_plan(
+        &mut runner,
+        &config,
+        profile,
+        &parsed.endpoint,
+        &parsed.docker_cli,
+    )?;
+    write_docker_purge_new(&parsed.output, &plan)?;
+    println!(
+        "Planned explicit Docker system purge for endpoint {}; Engine ID {}; Docker CLI {}; Engine {}; client API {}; server API {}.",
+        escape(&plan.endpoint),
+        escape(&plan.identity.engine_id),
+        escape(&plan.identity.docker_cli_version),
+        escape(&plan.identity.engine_version),
+        escape(&plan.identity.client_api_version),
+        escape(&plan.identity.server_api_version),
+    );
+    println!(
+        "Saved dynamic scope: stopped containers, unused networks, all unused images, build cache, and unused anonymous volumes. No per-resource preview, rollback, or size estimate is claimed."
+    );
+    Ok(())
+}
+
+fn parse_docker_purge_plan(args: &[String]) -> Result<ParsedDockerPurgePlan, Box<dyn Error>> {
+    let (mut config, mut docker_cli, mut endpoint, mut output, mut profile) =
+        (None, None, None, None, None);
+    let mut selected = false;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if flag == "--docker-purge" {
+            if selected {
+                return Err("duplicate argument: --docker-purge".into());
+            }
+            selected = true;
+            index += 1;
+            continue;
+        }
+        let value = args.get(index + 1).ok_or("missing value")?;
+        match flag {
+            "--config" if config.is_none() => config = Some(PathBuf::from(value)),
+            "--docker-cli" if docker_cli.is_none() => docker_cli = Some(PathBuf::from(value)),
+            "--docker-endpoint" if endpoint.is_none() => endpoint = Some(value.clone()),
+            "--output" if output.is_none() => output = Some(PathBuf::from(value)),
+            "--profile" if profile.is_none() => profile = Some(parse_profile(value)?),
+            _ => return Err("invalid arguments; use --help for usage".into()),
+        }
+        index += 2;
+    }
+    if !selected {
+        return Err("missing required flag: --docker-purge".into());
+    }
+    Ok(ParsedDockerPurgePlan {
+        config: config.ok_or("missing --config")?,
+        docker_cli: docker_cli.ok_or("missing --docker-cli")?,
+        endpoint: endpoint.ok_or("missing --docker-endpoint")?,
+        output: output.ok_or("missing --output")?,
+        profile,
+    })
+}
+
 fn run_nix_generation_plan(args: &[String]) -> Result<(), Box<dyn Error>> {
     let parsed = parse_nix_generation_plan(args)?;
     let config = Config::from_toml(&fs::read_to_string(&parsed.config)?)?;
@@ -368,12 +449,60 @@ fn run_apply(args: &[String]) -> Result<(), Box<dyn Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(nix_store::NixError::NonInteractive.into());
     }
-    let action = read_action_plan(&plan_path.ok_or("missing --plan")?)?;
+    let plan_path = plan_path.ok_or("missing --plan")?;
+    let action = read_action_plan(&plan_path)?;
+    if let ActionPlan::DockerPurge(plan) = &action {
+        validate_docker_purge_location(&plan_path, plan)?;
+    }
     let config_path = config_path.ok_or("missing --config")?;
     match action {
         ActionPlan::NixStore(plan) => run_apply_nix_store(&config_path, profile, plan),
         ActionPlan::NixGenerations(plan) => run_apply_nix_generations(&config_path, profile, plan),
+        ActionPlan::DockerPurge(plan) => run_apply_docker_purge(&config_path, profile, plan),
     }
+}
+
+fn run_apply_docker_purge(
+    config_path: &std::path::Path,
+    profile: Option<CleanupProfile>,
+    plan: DockerPurgeActionPlan,
+) -> Result<(), Box<dyn Error>> {
+    let load = || -> Result<(Config, CleanupProfile), DockerPurgeError> {
+        let contents =
+            fs::read_to_string(config_path).map_err(|_| DockerPurgeError::InvalidConfiguration)?;
+        let config = Config::from_toml(&contents).map_err(docker_purge::config_load_error)?;
+        let selected_profile = profile.unwrap_or_else(|| config.default_profile());
+        Ok((config, selected_profile))
+    };
+    let mut runner = CommandDockerPurgeRunner;
+    docker_purge::apply_with_confirmation(&mut runner, load, &plan, |plan| {
+        let confirmation = docker_purge::confirmation_phrase(plan)?;
+        println!(
+            "Docker system prune will dynamically remove stopped containers, unused networks, all unused images, build cache, and unused anonymous volumes from the selected daemon. Named volumes are excluded by the required Engine API 1.42+ behavior. Resources can change after this summary; native prune may partially mutate before an error and cannot be rolled back."
+        );
+        println!(
+            "Endpoint: {}; Engine ID: {}; CLI {}; Engine {}; client API {}; server API {}.",
+            escape(&plan.endpoint),
+            escape(&plan.identity.engine_id),
+            escape(&plan.identity.docker_cli_version),
+            escape(&plan.identity.engine_version),
+            escape(&plan.identity.client_api_version),
+            escape(&plan.identity.server_api_version),
+        );
+        print!("Type {confirmation} to continue: ");
+        io::stdout()
+            .flush()
+            .map_err(|_| DockerPurgeError::Interactive)?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|_| DockerPurgeError::Interactive)?;
+        Ok(answer.trim_end_matches(['\r', '\n']) == confirmation)
+    })?;
+    println!(
+        "Docker system prune completed. The daemon selected resources dynamically; no per-resource removal or reclaimed-size guarantee is made."
+    );
+    Ok(())
 }
 
 fn run_apply_nix_store(

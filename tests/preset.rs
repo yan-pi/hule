@@ -19,9 +19,11 @@ fn presets_materialize_complete_explicit_configurations() {
                 enabled
             );
             assert!(!config.categories(profile).contains(&Category::NixStoreGc));
+            assert!(!config.categories(profile).contains(&Category::DockerPurge));
         }
         assert!(toml.contains("schema_version = 2"));
         assert!(!toml.contains("projects"));
+        assert!(!toml.contains("docker_purge"));
         assert!(toml.contains("additional_keep_paths = []"));
     }
 }

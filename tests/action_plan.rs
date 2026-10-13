@@ -90,3 +90,26 @@ fn rejects_nested_and_duplicate_candidates() {
     p.closure.push(p.closure[0].clone());
     assert!(p.validate().is_err());
 }
+
+#[test]
+fn action_plan_dispatch_rejects_duplicate_json_keys_recursively() {
+    let d = tempfile::tempdir().unwrap();
+    let output = d.path().join("plan.json");
+    let serialized = serde_json::to_string(&plan(d.path())).unwrap();
+    let duplicated_format = serialized.replacen(
+        "\"format\":\"hule-nix-store-action\"",
+        "\"format\":\"unknown\",\"format\":\"hule-nix-store-action\"",
+        1,
+    );
+    fs::write(&output, duplicated_format).unwrap();
+    assert!(read_action_plan(&output).is_err());
+
+    let serialized = serde_json::to_string(&plan(d.path())).unwrap();
+    let duplicated_nested_endpoint = serialized.replacen(
+        "\"endpoint\":\"daemon\"",
+        "\"endpoint\":\"remote\",\"endpoint\":\"daemon\"",
+        1,
+    );
+    fs::write(&output, duplicated_nested_endpoint).unwrap();
+    assert!(read_action_plan(&output).is_err());
+}

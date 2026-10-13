@@ -545,6 +545,8 @@ fn help_and_version_are_supported() {
     let help_text = String::from_utf8_lossy(&help.stdout);
     assert!(help_text.contains("preview rust-target"));
     assert!(help_text.contains("plan nix-generations"));
+    assert!(help_text.contains("plan docker --docker-purge"));
+    assert!(help_text.contains("--docker-cli /ABS/PATH/docker"));
     assert!(help_text.contains("--nix-profile NAME --generation ID"));
     assert!(help_text.contains(
         "Cargo metadata (`cargo metadata --no-deps --offline --locked`) may be invoked only when each project is registered"
@@ -564,6 +566,94 @@ fn help_and_version_are_supported() {
             .trim(),
         format!("hule {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn docker_purge_requires_explicit_selection_and_apply_cannot_upgrade_scope() {
+    let fixture = tempfile::tempdir().unwrap();
+    let missing_selection = invoke(&[
+        "plan",
+        "docker",
+        "--config",
+        "/missing/config.toml",
+        "--docker-endpoint",
+        "unix:///tmp/not-a-docker-socket",
+        "--output",
+        "/tmp/docker-plan.json",
+    ]);
+    assert_eq!(
+        missing_selection.stderr,
+        b"hule: missing required flag: --docker-purge\n"
+    );
+
+    let duplicate_selection = invoke(&[
+        "plan",
+        "docker",
+        "--docker-purge",
+        "--docker-purge",
+        "--config",
+        "/missing/config.toml",
+        "--docker-endpoint",
+        "unix:///tmp/not-a-docker-socket",
+        "--output",
+        "/tmp/docker-plan.json",
+    ]);
+    assert_eq!(
+        duplicate_selection.stderr,
+        b"hule: duplicate argument: --docker-purge\n"
+    );
+
+    let apply_flag = invoke(&[
+        "apply",
+        "--plan",
+        "/missing/plan.json",
+        "--config",
+        "/missing/config.toml",
+        "--docker-purge",
+        "yes",
+    ]);
+    assert_eq!(
+        apply_flag.stderr,
+        b"hule: invalid arguments; use --help for usage\n"
+    );
+    assert!(!fixture.path().join("docker-plan.json").exists());
+}
+
+#[test]
+fn docker_plan_rejects_inherited_endpoint_context_or_config_overrides_before_execution() {
+    let fixture = tempfile::tempdir().unwrap();
+    let config = fixture.path().join("config.toml");
+    fs::write(
+        &config,
+        "schema_version = 2\ndefault_profile = \"aggressive\"\n\n[profiles.low]\ncategories = []\n[profiles.normal]\ncategories = []\n[profiles.aggressive]\ncategories = [\"docker_purge\"]\n",
+    )
+    .unwrap();
+    let output_path = fixture.path().join("plan.json");
+    let socket = fixture.path().join("missing.sock");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hule"));
+    command
+        .args([
+            "plan",
+            "docker",
+            "--docker-purge",
+            "--config",
+            config.to_str().unwrap(),
+            "--docker-cli",
+            "/usr/bin/docker",
+            "--docker-endpoint",
+            &format!("unix://{}", socket.display()),
+            "--output",
+            output_path.to_str().unwrap(),
+            "--profile",
+            "aggressive",
+        ])
+        .env("DOCKER_CONTEXT", "fixture-context");
+    let result = command.output().unwrap();
+    assert_eq!(
+        result.stderr,
+        b"hule: Docker purge refuses inherited Docker endpoint, context, API, TLS or config overrides\n"
+    );
+    assert!(!output_path.exists());
 }
 
 #[test]

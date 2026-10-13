@@ -2,9 +2,13 @@ use crate::{
     CleanupProfile,
     config::{Category, NixProfileKind},
 };
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, MapAccess, SeqAccess, Visitor},
+};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
+    fmt,
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -44,6 +48,28 @@ pub struct FileIdentity {
     pub uid: u32,
     pub gid: u32,
     pub mode: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DockerFileIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub size: u64,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DockerDirectoryIdentity {
+    pub path: PathBuf,
+    pub identity: FileIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,10 +132,45 @@ pub struct NixGenerationActionPlan {
     pub activation_roots: Vec<ActivationRootSnapshot>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DockerPurgeActionPlan {
+    pub format: String,
+    pub schema_version: u8,
+    pub profile: CleanupProfile,
+    pub category: Category,
+    pub endpoint: String,
+    pub endpoint_identity: DockerFileIdentity,
+    pub endpoint_parent_identities: Vec<DockerDirectoryIdentity>,
+    pub identity: DockerPurgeIdentity,
+    pub scope: DockerPurgeScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DockerPurgeIdentity {
+    pub docker_cli_path: PathBuf,
+    pub docker_cli_file_identity: DockerFileIdentity,
+    pub docker_cli_parent_identities: Vec<DockerDirectoryIdentity>,
+    pub docker_cli_version: String,
+    pub engine_id: String,
+    pub daemon_data_root: PathBuf,
+    pub engine_version: String,
+    pub client_api_version: String,
+    pub server_api_version: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerPurgeScope {
+    SystemPruneAllWithAnonymousVolumes,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionPlan {
     NixStore(NixStoreActionPlan),
     NixGenerations(NixGenerationActionPlan),
+    DockerPurge(DockerPurgeActionPlan),
 }
 
 impl NixGenerationActionPlan {
@@ -228,6 +289,138 @@ impl NixGenerationActionPlan {
         }
         Ok(())
     }
+}
+
+impl DockerPurgeActionPlan {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.format != "hule-docker-purge-action"
+            || self.schema_version != 1
+            || self.profile != CleanupProfile::Aggressive
+            || self.category != Category::DockerPurge
+            || !valid_docker_socket_endpoint(&self.endpoint)
+            || self.endpoint_identity.mode & 0o170000 != 0o140000
+            || !trusted_docker_owner(self.endpoint_identity.uid)
+            || !valid_docker_parent_identities(
+                Path::new(self.endpoint.strip_prefix("unix://").unwrap_or_default()),
+                &self.endpoint_parent_identities,
+            )
+            || !valid_absolute_normalized_path(&self.identity.docker_cli_path)
+            || self.identity.docker_cli_path.file_name() != Some(std::ffi::OsStr::new("docker"))
+            || !valid_docker_cli_file_identity(&self.identity.docker_cli_file_identity)
+            || !valid_docker_parent_identities(
+                &self.identity.docker_cli_path,
+                &self.identity.docker_cli_parent_identities,
+            )
+            || !valid_version_string(&self.identity.docker_cli_version)
+            || !valid_version_string(&self.identity.engine_id)
+            || !valid_absolute_normalized_path(&self.identity.daemon_data_root)
+            || !valid_version_string(&self.identity.engine_version)
+            || !valid_api_version(&self.identity.client_api_version)
+            || !valid_api_version(&self.identity.server_api_version)
+        {
+            return Err("invalid plan");
+        }
+        Ok(())
+    }
+}
+
+fn valid_docker_cli_file_identity(identity: &DockerFileIdentity) -> bool {
+    identity.mode & 0o170000 == 0o100000
+        && identity.mode & 0o111 != 0
+        && identity.mode & 0o022 == 0
+        && trusted_docker_owner(identity.uid)
+}
+
+fn trusted_docker_owner(uid: u32) -> bool {
+    uid == 0 || uid == unsafe { libc::geteuid() }
+}
+
+fn valid_docker_parent_identities(
+    file_path: &Path,
+    identities: &[DockerDirectoryIdentity],
+) -> bool {
+    let Some(parent) = file_path.parent() else {
+        return false;
+    };
+    let mut expected = vec![PathBuf::from("/")];
+    let mut current = PathBuf::from("/");
+    for component in parent.components().skip(1) {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        current.push(name);
+        expected.push(current.clone());
+    }
+    identities.len() == expected.len()
+        && identities.iter().zip(expected).all(|(snapshot, path)| {
+            let mode = snapshot.identity.mode;
+            let safe_permissions =
+                mode & 0o022 == 0 || (snapshot.identity.uid == 0 && mode & 0o1000 != 0);
+            snapshot.path == path
+                && trusted_docker_owner(snapshot.identity.uid)
+                && (snapshot.path == Path::new("/")
+                    || valid_absolute_normalized_path(&snapshot.path))
+                && mode & 0o170000 == 0o040000
+                && safe_permissions
+        })
+}
+
+pub(crate) fn valid_docker_socket_endpoint(endpoint: &str) -> bool {
+    let Some(path_text) = endpoint.strip_prefix("unix://") else {
+        return false;
+    };
+    if !path_text.starts_with('/')
+        || path_text.contains(['%', '?', '#'])
+        || endpoint.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let path = Path::new(path_text);
+    path != Path::new("/")
+        && path.is_absolute()
+        && path.to_string_lossy() == path_text
+        && path == path.components().collect::<PathBuf>()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+}
+
+fn valid_absolute_normalized_path(path: &Path) -> bool {
+    path != Path::new("/")
+        && path.is_absolute()
+        && path == path.components().collect::<PathBuf>()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+        && !path.to_string_lossy().chars().any(char::is_control)
+}
+
+fn valid_version_string(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.is_ascii()
+        && value.bytes().all(|byte| !byte.is_ascii_control())
+}
+
+fn valid_api_version(value: &str) -> bool {
+    let mut components = value.split('.');
+    let Some(major_text) = components.next() else {
+        return false;
+    };
+    let Some(minor_text) = components.next() else {
+        return false;
+    };
+    let (Ok(major), Ok(minor)) = (major_text.parse::<u32>(), minor_text.parse::<u32>()) else {
+        return false;
+    };
+    components.next().is_none()
+        && major == 1
+        && minor >= 42
+        && major_text == major.to_string()
+        && minor_text == minor.to_string()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
 }
 
 impl NixStoreActionPlan {
@@ -412,6 +605,55 @@ pub fn write_generation_new(
     write_private_new(path, &bytes)
 }
 
+pub fn write_docker_purge_new(
+    path: &Path,
+    plan: &DockerPurgeActionPlan,
+) -> Result<(), &'static str> {
+    plan.validate()?;
+    validate_docker_purge_location(path, plan)?;
+    let bytes = serde_json::to_vec_pretty(plan).map_err(|_| "could not save plan")?;
+    if bytes.len() as u64 > MAX_PLAN_BYTES {
+        return Err("invalid plan");
+    }
+    write_private_new(path, &bytes)
+}
+
+pub fn validate_docker_purge_location(
+    path: &Path,
+    plan: &DockerPurgeActionPlan,
+) -> Result<(), &'static str> {
+    plan.validate()?;
+    validate_new_output_parent(path, &plan.identity.daemon_data_root)
+}
+
+fn validate_new_output_parent(path: &Path, daemon_data_root: &Path) -> Result<(), &'static str> {
+    let parent = path.parent().ok_or("invalid plan output path")?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let _file_name = path.file_name().ok_or("invalid plan output path")?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|_| "invalid plan output path")?;
+    if !canonical_parent.is_dir() {
+        return Err("invalid plan output path");
+    }
+    let canonical_output = canonical_parent.join(_file_name);
+    if overlaps(&canonical_output, daemon_data_root) {
+        return Err("invalid plan output path");
+    }
+    match fs::canonicalize(daemon_data_root) {
+        Ok(canonical_root) => {
+            if !canonical_root.is_dir() || overlaps(&canonical_output, &canonical_root) {
+                return Err("invalid plan output path");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("invalid plan output path"),
+    }
+    Ok(())
+}
+
 pub fn read_action_plan(path: &Path) -> Result<ActionPlan, &'static str> {
     let bytes = read_bounded_plan(path)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "invalid plan")?;
@@ -427,6 +669,12 @@ pub fn read_action_plan(path: &Path) -> Result<ActionPlan, &'static str> {
                 serde_json::from_value(value).map_err(|_| "invalid plan")?;
             plan.validate()?;
             Ok(ActionPlan::NixGenerations(plan))
+        }
+        Some("hule-docker-purge-action") => {
+            let plan: DockerPurgeActionPlan =
+                serde_json::from_value(value).map_err(|_| "invalid plan")?;
+            plan.validate()?;
+            Ok(ActionPlan::DockerPurge(plan))
         }
         _ => Err("invalid plan"),
     }
@@ -445,7 +693,111 @@ fn read_bounded_plan(path: &Path) -> Result<Vec<u8>, &'static str> {
     if bytes.len() as u64 > MAX_PLAN_BYTES {
         return Err("invalid plan");
     }
+    reject_duplicate_json_keys(&bytes)?;
     Ok(bytes)
+}
+
+fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<(), &'static str> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    DuplicateKeyScan::deserialize(&mut deserializer).map_err(|_| "invalid plan")?;
+    deserializer.end().map_err(|_| "invalid plan")
+}
+
+struct DuplicateKeyScan;
+
+impl<'de> Deserialize<'de> for DuplicateKeyScan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateKeyVisitor)
+    }
+}
+
+struct DuplicateKeyVisitor;
+
+impl<'de> Visitor<'de> for DuplicateKeyVisitor {
+    type Value = DuplicateKeyScan;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value with unique object keys")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_bytes<E>(self, _: &[u8]) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_byte_buf<E>(self, _: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        DuplicateKeyScan::deserialize(deserializer)
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        DuplicateKeyScan::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<DuplicateKeyScan>()?.is_some() {}
+        Ok(DuplicateKeyScan)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+            map.next_value::<DuplicateKeyScan>()?;
+        }
+        Ok(DuplicateKeyScan)
+    }
 }
 
 fn validate_generation_output(

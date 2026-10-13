@@ -230,6 +230,63 @@ fn no_keep_path_means_no_configurated_overla() {
 }
 
 #[test]
+fn docker_purge_is_a_separate_aggressive_only_opt_in() {
+    let config = Config::from_toml(
+        r#"schema_version = 2
+ default_profile = "normal"
+ [profiles.low]
+ categories = []
+ [profiles.normal]
+ categories = []
+ [profiles.aggressive]
+ categories = ["docker_purge"]
+ "#,
+    )
+    .expect("Docker purge is an explicit schema-v2 category");
+    assert!(
+        !config
+            .categories(CleanupProfile::Low)
+            .contains(&Category::DockerPurge)
+    );
+    assert!(
+        !config
+            .categories(CleanupProfile::Normal)
+            .contains(&Category::DockerPurge)
+    );
+    assert!(
+        config
+            .categories(CleanupProfile::Aggressive)
+            .contains(&Category::DockerPurge)
+    );
+
+    for invalid in [
+        r#"schema_version = 2
+ default_profile = "normal"
+ [profiles.low]
+ categories = ["docker_purge"]
+ [profiles.normal]
+ categories = []
+ [profiles.aggressive]
+ categories = []
+ "#,
+        r#"schema_version = 2
+ default_profile = "normal"
+ [profiles.low]
+ categories = []
+ [profiles.normal]
+ categories = ["docker_purge"]
+ [profiles.aggressive]
+ categories = []
+ "#,
+    ] {
+        assert_eq!(
+            Config::from_toml(invalid).unwrap_err(),
+            ConfigError::InvalidToml
+        );
+    }
+}
+
+#[test]
 fn generation_categories_are_independently_opt_in_and_old_configs_default_empty() {
     let config = Config::from_toml(
         r#"schema_version = 2
