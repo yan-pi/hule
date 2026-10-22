@@ -1,7 +1,10 @@
 pub mod action_plan;
 pub mod config;
 pub mod docker_purge;
+pub mod doctor;
+pub mod inventory;
 pub mod nix_generations;
+pub mod nix_inspection;
 pub mod nix_store;
 pub mod preset;
 pub mod preview;

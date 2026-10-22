@@ -375,3 +375,99 @@ fn fixture_endpoint_rejects_store_and_profile_aliases() {
             .starts_with(fixture.root.path())
     );
 }
+
+#[test]
+fn readonly_inspection_lists_generation_roles_without_removal() {
+    use hule::nix_inspection::{GenerationRole, InspectionAuthorization, InspectionStatus};
+
+    let fixture = Fixture::new();
+    let mut runner = fixture.runner(&[], true);
+    let report = nix_generations::local_test_support::inspect_profile(
+        &mut runner,
+        &fixture.config,
+        CleanupProfile::Normal,
+        "hm",
+        &[2],
+        fixture.root.path(),
+    )
+    .unwrap();
+
+    assert_eq!(report.current_generation, 3);
+    assert_eq!(
+        report
+            .generations
+            .iter()
+            .map(|g| (g.id, g.role))
+            .collect::<Vec<_>>(),
+        [
+            (1, GenerationRole::Historical),
+            (2, GenerationRole::SelectedHistorical),
+            (3, GenerationRole::Current),
+        ]
+    );
+    assert_eq!(report.authorization, InspectionAuthorization::NotAuthorized);
+    let json = serde_json::to_string(&report).unwrap();
+    assert!(json.contains("\"cleanup_profile\":\"normal\""));
+    assert!(report.to_human().contains("cleanup profile: normal"));
+    assert_eq!(report.host_scope, InspectionStatus::Unchecked);
+    assert_eq!(report.version_scope, InspectionStatus::Unchecked);
+    assert_eq!(report.store_scope, InspectionStatus::Unchecked);
+    assert!(report.history_removes_profile_links_only);
+    assert!(!report.store_gc_performed);
+    assert!(runner.calls.is_empty());
+}
+
+#[test]
+fn readonly_inspection_rejects_disabled_protected_and_current_selection() {
+    let fixture = Fixture::new();
+    let mut runner = fixture.runner(&[], true);
+    let disabled = Config::from_toml(&format!(
+        "schema_version=2\ndefault_profile='normal'\n[profiles.low]\ncategories=[]\n[profiles.normal]\ncategories=[]\n[profiles.aggressive]\ncategories=[]\n[nix_profiles.hm]\nkind='home_manager'\npath='{}'\ncurrent_home_roots=['{}']\n",
+        fixture.profile.display(), fixture.roots[0].display()
+    )).unwrap();
+    assert_eq!(
+        nix_generations::local_test_support::inspect_profile(
+            &mut runner,
+            &disabled,
+            CleanupProfile::Normal,
+            "hm",
+            &[],
+            fixture.root.path()
+        )
+        .unwrap_err(),
+        GenerationError::Disabled
+    );
+    assert!(runner.calls.is_empty());
+
+    let protected = Config::from_toml(&format!(
+        "schema_version=2\ndefault_profile='normal'\nadditional_keep_paths=['{}']\n[profiles.low]\ncategories=[]\n[profiles.normal]\ncategories=['nix_home_manager_generations']\n[profiles.aggressive]\ncategories=[]\n[nix_profiles.hm]\nkind='home_manager'\npath='{}'\ncurrent_home_roots=['{}']\n",
+        fixture.targets[0].display(), fixture.profile.display(), fixture.roots[0].display()
+    )).unwrap();
+    assert_eq!(
+        nix_generations::local_test_support::inspect_profile(
+            &mut runner,
+            &protected,
+            CleanupProfile::Normal,
+            "hm",
+            &[1],
+            fixture.root.path()
+        )
+        .unwrap_err(),
+        GenerationError::Protected
+    );
+    assert!(runner.calls.is_empty());
+
+    assert_eq!(
+        nix_generations::local_test_support::inspect_profile(
+            &mut runner,
+            &fixture.config,
+            CleanupProfile::Normal,
+            "hm",
+            &[3],
+            fixture.root.path()
+        )
+        .unwrap_err(),
+        GenerationError::UnsafePath
+    );
+    assert!(runner.calls.is_empty());
+}

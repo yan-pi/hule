@@ -1,6 +1,6 @@
 # Hule
 
-Hule is a Rust command-line cleanup tool with explicit retention policy, read-only Rust-target previews, narrowly scoped Nix store and generation plan/apply providers, and a separate explicit Docker system-purge plan/apply provider. Nix generation support passed its native matrix on Nix 2.34.6 in an isolated OrbStack guest and passed independent safety review; other Nix versions remain unsupported. This is guest-only evidence, not validation or cleanup of host profiles. Generation-history removal is not transactional, concurrent Nix writers and Home Manager activation are not serialized, and no reclaimed-byte guarantee is made. Docker purge is covered only by injected-runner tests; no Docker daemon was contacted or purged for this implementation.
+Hule is a Rust command-line cleanup tool with explicit retention policy, read-only Rust-target previews, non-authorizing Nix store/profile inspection, narrowly scoped Nix store and generation plan/apply providers, and a separate explicit Docker system-purge plan/apply provider. Nix generation support passed its native matrix on Nix 2.34.6 in an isolated OrbStack guest and passed independent safety review; other Nix versions remain unsupported. This is guest-only evidence, not validation or cleanup of host profiles. Generation-history removal is not transactional, concurrent Nix writers and Home Manager activation are not serialized, and no reclaimed-byte guarantee is made. Docker purge is covered only by injected-runner tests; no Docker daemon was contacted or purged for this implementation.
 
 ## Current status
 
@@ -17,6 +17,9 @@ Available commands:
 ```text
 hule --help
 hule --version
+hule doctor --config PATH [--json]
+hule inspect nix-store --config PATH --store-path PATH... [--profile low|normal|aggressive] [--json]
+hule inspect nix-generations --config PATH --nix-profile NAME [--generation ID...] [--profile low|normal|aggressive] [--json]
 hule config preset NAME
 hule project register --name NAME --path PATH --mode persistent|ephemeral [--state PATH]
 hule project list [--state PATH]
@@ -29,6 +32,21 @@ hule apply --plan PATH --config PATH [--profile low|normal|aggressive]
 ```
 
 Exactly one of `--project NAME` and `--all` is required. `--all` previews only registered projects, in project-name order; each human report is delimited and includes that project's discovery and retention result. An empty human preview prints `no registered projects` and succeeds without invoking Cargo. `--profile` is optional and otherwise the configuration's `default_profile` is used. `--json` emits one pretty, read-only plan document for either selection, including schema version, profile, category, per-project discovery/decision entries, and `authorization: not_authorized`; it never writes a plan or authorizes cleanup. Cargo metadata (`cargo metadata --no-deps --format-version=1 --offline --locked --manifest-path <registered-root>/Cargo.toml`) may be invoked only for a registered project when `rust_target` is enabled for the selected profile and the anticipated target is not already protected. It may discover Cargo's `target_directory` only when it is an existing real directory contained within the registered project root. It does not enumerate target contents, request a build or clean, or delete anything. Cargo's documentation does not formally guarantee that metadata has no side effects or executes no code. The Rust preview performs no cleanup or deletion; unsupported metadata, paths, and errors are reported generically. `retention-eligible` means only that retention rules passed; it is not authorization to exclude or remove anything. Nix actions use separate strict, versioned action-plan JSON; the Rust informational JSON is never accepted by apply.
+
+## Read-only readiness report
+
+`hule doctor --config PATH [--json]` parses only the explicitly supplied configuration and reports its profile/category settings, configured Nix profile names, and static capability limits. It does not invoke Cargo, Nix, Docker, or OrbStack; inspect host paths or cache contents; or contact a daemon. `available` describes an implemented local capability, while `unchecked` means this command did not validate host compatibility. The report marks Rust cleanup, OrbStack reset, and unimplemented cache providers as unsupported; it also states M2's Nix 2.34.6/profile restrictions, the unverified Nix host/store scope, and Docker's mock-only native-acceptance status and lack of resource-level keep exclusions. Keep-path values and provider paths are not emitted. An unreadable or invalid config is reported as `unsafe` without echoing its path or contents. This diagnostic is not an authorization or a gate/upgrade for `apply`.
+
+## Nix inspection (no cleanup authorization)
+
+`hule inspect nix-store` inspects only explicitly supplied top-level store objects and their requisites closure; it does not scan the store, write an action plan, delete objects, run garbage collection, or authorize cleanup. It requires `nix_store_gc` to be enabled for the selected cleanup profile. `hule inspect nix-generations` inspects one explicitly configured named user/Home Manager profile and can mark explicitly supplied historical IDs; generation inspection is supported only for Nix 2.34.6. It does not remove profile links, activate generations, delete store objects, run GC, or produce an apply input. Both commands default to the configured cleanup profile and support `--json`.
+
+These are Nix queries, not side-effect-free host checks: store identity/requisites queries may open, create, or migrate Nix store metadata. The selected store objects/profile and host/store scope are explicit, but the report does not establish a reclaimed-byte estimate or authorize deletion. The Nix store daemon may represent a shared/system store. No native Nix inspection command was run during development; tests use injected runners or temporary CLI stubs only.
+
+```sh
+hule inspect nix-store --config ./hule.toml --store-path /nix/store/EXPLICIT-OBJECT --json
+hule inspect nix-generations --config ./hule.toml --nix-profile work
+```
 
 ## Explicit Docker purge
 

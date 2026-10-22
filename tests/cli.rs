@@ -543,6 +543,12 @@ fn help_and_version_are_supported() {
     let help = invoke(&["--help"]);
     assert!(help.status.success());
     let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(help_text.contains("doctor --config PATH [--json]"));
+    assert!(help_text.contains("inspect nix-store --config PATH --store-path PATH..."));
+    assert!(help_text.contains("inspect nix-generations --config PATH --nix-profile NAME"));
+    assert!(help_text.contains("inventory rust-target --config PATH --project NAME --target PATH"));
+    assert!(help_text.contains("inventory xcode-derived-data --path PATH"));
+    assert!(help_text.contains("Nix inspection queries only explicitly selected store objects"));
     assert!(help_text.contains("preview rust-target"));
     assert!(help_text.contains("plan nix-generations"));
     assert!(help_text.contains("plan docker --docker-purge"));
@@ -566,6 +572,370 @@ fn help_and_version_are_supported() {
             .trim(),
         format!("hule {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn doctor_reports_configuration_without_invoking_provider_commands_or_echoing_paths() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let config = fixture.path().join("config.toml");
+    fs::write(
+        &config,
+        r#"schema_version = 2
+ default_profile = "aggressive"
+ additional_keep_paths = ["/private/keep-secret"]
+ [profiles.low]
+ categories = []
+ [profiles.normal]
+ categories = []
+ [profiles.aggressive]
+ categories = ["docker_purge"]
+ "#,
+    )
+    .unwrap();
+
+    let provider_bin = fixture.path().join("bin");
+    fs::create_dir(&provider_bin).unwrap();
+    let marker = fixture.path().join("provider-was-invoked");
+    for provider in ["cargo", "nix-store", "nix-env", "docker", "orb", "orbctl"] {
+        let executable = provider_bin.join(provider);
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let json = Command::new(env!("CARGO_BIN_EXE_hule"))
+        .args(["doctor", "--config", config.to_str().unwrap(), "--json"])
+        .env("PATH", &provider_bin)
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    assert!(json.stderr.is_empty());
+    let json_text = String::from_utf8(json.stdout).unwrap();
+    assert!(json_text.contains("\"docker_system_prune\""));
+    assert!(!json_text.contains("/private/keep-secret"));
+    assert!(!json_text.contains(config.to_str().unwrap()));
+    assert!(!marker.exists());
+
+    let human = invoke(&["doctor", "--config", config.to_str().unwrap()]);
+    assert!(human.status.success());
+    let human_text = String::from_utf8(human.stdout).unwrap();
+    assert!(human_text.contains("configuration: available"));
+    assert!(!human_text.contains("/private/keep-secret"));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn doctor_invalid_configuration_reports_unsafe_without_echoing_contents_or_path() {
+    let fixture = tempfile::tempdir().unwrap();
+    let config = fixture.path().join("secret-config.toml");
+    fs::write(&config, "schema_version = 99\nsecret = \"do-not-echo\"\n").unwrap();
+    let output = invoke(&["doctor", "--config", config.to_str().unwrap(), "--json"]);
+    assert!(output.status.success());
+    let json = String::from_utf8(output.stdout).unwrap();
+    assert!(json.contains("\"configuration\": \"unsafe\""));
+    assert!(!json.contains("do-not-echo"));
+    assert!(!json.contains(config.to_str().unwrap()));
+}
+
+#[test]
+fn nix_generation_inspection_parser_rejects_duplicate_ids_before_loading_config() {
+    let duplicate = invoke(&[
+        "inspect",
+        "nix-generations",
+        "--config",
+        "/missing/config.toml",
+        "--nix-profile",
+        "work",
+        "--generation",
+        "1",
+        "--generation",
+        "1",
+    ]);
+    assert!(!duplicate.status.success());
+    assert_eq!(duplicate.stderr, b"hule: duplicate generation id\n");
+
+    let noncanonical = invoke(&[
+        "inspect",
+        "nix-generations",
+        "--config",
+        "/missing/config.toml",
+        "--nix-profile",
+        "work",
+        "--generation",
+        "01",
+    ]);
+    assert!(!noncanonical.status.success());
+    assert_eq!(noncanonical.stderr, b"hule: invalid generation id\n");
+}
+
+#[test]
+fn nix_store_inspection_reports_only_explicit_fixture_selection_without_deleting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let store = fixture.path().join("nix/store");
+    fs::create_dir_all(&store).unwrap();
+    let store = fs::canonicalize(store).unwrap();
+    let object = store.join("abc-selected-object");
+    fs::write(&object, b"fixture object").unwrap();
+    let config = fixture.path().join("config.toml");
+    fs::write(
+        &config,
+        "schema_version=2\ndefault_profile='normal'\n[profiles.low]\ncategories=[]\n[profiles.normal]\ncategories=['nix_store_gc']\n[profiles.aggressive]\ncategories=[]\n",
+    )
+    .unwrap();
+    let provider_bin = fixture.path().join("bin");
+    fs::create_dir(&provider_bin).unwrap();
+    let deletion_marker = fixture.path().join("delete-called");
+    let nix = provider_bin.join("nix");
+    fs::write(
+        &nix,
+        r##"#!/bin/sh
+printf '%s\n' "$HULE_TEST_STORE"
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&nix, fs::Permissions::from_mode(0o700)).unwrap();
+    let nix_store = provider_bin.join("nix-store");
+    fs::write(
+        &nix_store,
+        format!(
+            r##"#!/bin/sh
+for arg do
+  case "$arg" in
+    --version) printf 'nix-store fixture\n'; exit 0 ;;
+    --query) printf '%s\n' "$HULE_TEST_OBJECT"; exit 0 ;;
+    --delete) printf called > '{}'; exit 0 ;;
+  esac
+done
+exit 73
+"##,
+            deletion_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&nix_store, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hule"));
+    command
+        .args([
+            "inspect",
+            "nix-store",
+            "--config",
+            config.to_str().unwrap(),
+            "--store-path",
+            object.to_str().unwrap(),
+            "--json",
+        ])
+        .env("PATH", &provider_bin)
+        .env("HULE_TEST_STORE", &store)
+        .env("HULE_TEST_OBJECT", &object);
+    let json = command.output().unwrap();
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    assert!(json.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["authorization"], "not_authorized");
+    assert_eq!(report["selected_objects"][0], object.to_str().unwrap());
+    assert_eq!(report["requisites"][0], object.to_str().unwrap());
+    assert!(!deletion_marker.exists());
+
+    let human = Command::new(env!("CARGO_BIN_EXE_hule"))
+        .args([
+            "inspect",
+            "nix-store",
+            "--config",
+            config.to_str().unwrap(),
+            "--store-path",
+            object.to_str().unwrap(),
+        ])
+        .env("PATH", &provider_bin)
+        .env("HULE_TEST_STORE", &store)
+        .env("HULE_TEST_OBJECT", &object)
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text.contains("not authorization"));
+    assert!(text.contains(object.to_str().unwrap()));
+    assert!(text.contains("metadata"));
+    assert!(!deletion_marker.exists());
+}
+
+#[test]
+fn xcode_inventory_cli_reports_fixture_without_paths_or_contents() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture
+        .path()
+        .join("Library/Developer/Xcode/DerivedData");
+    let target = root.join("Private Project/Build/Products");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("secret-artifact.o"), b"private cache contents").unwrap();
+    let root = fs::canonicalize(root).unwrap();
+
+    let json = invoke(&[
+        "inventory",
+        "xcode-derived-data",
+        "--path",
+        root.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(json.status.success(), "{}", String::from_utf8_lossy(&json.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["state"], "complete");
+    assert_eq!(value["authorization"], "not_authorized");
+    assert_eq!(value["summary"]["file_entries"], 1);
+    assert_eq!(value["summary"]["apparent_bytes"], 22);
+    let json_text = String::from_utf8(json.stdout).unwrap();
+    assert!(!json_text.contains(&root.to_string_lossy().to_string()));
+    assert!(!json_text.contains("Private Project"));
+    assert!(!json_text.contains("secret-artifact.o"));
+    assert!(!json_text.contains("private cache contents"));
+
+    let human = invoke(&[
+        "inventory",
+        "xcode-derived-data",
+        "--path",
+        root.to_str().unwrap(),
+    ]);
+    assert!(human.status.success());
+    let human_text = String::from_utf8(human.stdout).unwrap();
+    assert!(human_text.contains("not authorized"));
+    assert!(human_text.contains("apparent bytes: 22"));
+    assert!(human_text.contains("best-effort"));
+    assert!(!human_text.contains(&root.to_string_lossy().to_string()));
+    assert!(!human_text.contains("secret-artifact.o"));
+}
+
+#[test]
+fn rust_target_inventory_cli_requires_registered_opted_in_unprotected_target() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let project = fixture.path().join("project with spaces");
+    let target = project.join("custom-build/target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("private-name"), b"not read").unwrap();
+    let project = fs::canonicalize(project).unwrap();
+    let target = fs::canonicalize(target).unwrap();
+    let config = fixture.path().join("config.toml");
+    fs::write(
+        &config,
+        r#"schema_version=2
+ default_profile='normal'
+ [profiles.low]
+ categories=['rust_target']
+ [profiles.normal]
+ categories=['rust_target']
+ [profiles.aggressive]
+ categories=['rust_target']
+ "#,
+    )
+    .unwrap();
+    let state = fixture.path().join("projects.toml");
+    fs::write(
+        &state,
+        format!(
+            r#"version=1
+ [projects.fixture]
+ path='{}'
+ mode='ephemeral'
+ "#,
+            project.display()
+        ),
+    )
+    .unwrap();
+
+    let provider_bin = fixture.path().join("bin");
+    fs::create_dir(&provider_bin).unwrap();
+    let marker = fixture.path().join("provider-invoked");
+    for provider in ["cargo", "nix", "nix-store", "docker", "orb", "orbctl"] {
+        let executable = provider_bin.join(provider);
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+printf invoked > '{}'
+"#,
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hule"));
+    command
+        .args([
+            "inventory",
+            "rust-target",
+            "--config",
+            config.to_str().unwrap(),
+            "--project",
+            "fixture",
+            "--target",
+            target.to_str().unwrap(),
+            "--state",
+            state.to_str().unwrap(),
+            "--profile",
+            "aggressive",
+            "--json",
+        ])
+        .env("PATH", &provider_bin);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["state"], "complete");
+    assert_eq!(value["kind"], "rust_target");
+    assert_eq!(value["authorization"], "not_authorized");
+    assert_eq!(value["summary"]["file_entries"], 1);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains(&project.to_string_lossy().to_string()));
+    assert!(!text.contains(&target.to_string_lossy().to_string()));
+    assert!(!text.contains("private-name"));
+    assert!(!marker.exists());
+
+    let disabled = fixture.path().join("disabled.toml");
+    fs::write(
+        &disabled,
+        r#"schema_version=2
+ default_profile='normal'
+ [profiles.low]
+ categories=[]
+ [profiles.normal]
+ categories=[]
+ [profiles.aggressive]
+ categories=[]
+ "#,
+    )
+    .unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_hule"))
+        .args([
+            "inventory",
+            "rust-target",
+            "--config",
+            disabled.to_str().unwrap(),
+            "--project",
+            "fixture",
+            "--target",
+            target.to_str().unwrap(),
+            "--state",
+            state.to_str().unwrap(),
+        ])
+        .env("PATH", &provider_bin)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("rust_target is not enabled"));
+    assert!(!marker.exists());
 }
 
 #[test]

@@ -282,6 +282,61 @@ pub fn create_plan(
     create_plan_at(r, config, profile, inputs, DAEMON)
 }
 
+fn validate_inputs(inputs: &[PathBuf]) -> Result<(), NixError> {
+    if inputs.is_empty() || inputs.len() > MAX_INPUTS {
+        return Err(NixError::UnsafePath);
+    }
+    if inputs.iter().any(|path| {
+        !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+    }) || inputs
+        .iter()
+        .map(|path| path.parent())
+        .any(|parent| parent.is_none() || parent != inputs[0].parent())
+        || inputs.iter().collect::<BTreeSet<_>>().len() != inputs.len()
+    {
+        return Err(NixError::UnsafePath);
+    }
+    Ok(())
+}
+
+/// Inspects explicitly selected store objects without creating an action plan or deleting data.
+pub fn inspect(
+    r: &mut impl NixRunner,
+    config: &Config,
+    profile: CleanupProfile,
+    inputs: Vec<PathBuf>,
+) -> Result<crate::nix_inspection::NixStoreInspection, NixError> {
+    validate_inputs(&inputs)?;
+    gate(config, profile, &inputs)?;
+    let identity = identity(r, DAEMON)?;
+    for path in &inputs {
+        validate_top(path, &identity.store_dir)?;
+    }
+    let selected_objects = inputs
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let requisites = closure(r, DAEMON, &selected_objects, &identity.store_dir)?;
+    gate(config, profile, &requisites)?;
+    Ok(crate::nix_inspection::NixStoreInspection {
+        format: "hule-nix-store-inspection",
+        schema_version: 1,
+        profile,
+        selected_objects,
+        requisites,
+        host_scope: crate::nix_inspection::InspectionStatus::Unchecked,
+        version_scope: crate::nix_inspection::InspectionStatus::Unchecked,
+        store_scope: crate::nix_inspection::InspectionStatus::Unchecked,
+        reclaimed_bytes: crate::nix_inspection::InspectionStatus::Unchecked,
+        authorization: crate::nix_inspection::InspectionAuthorization::NotAuthorized,
+        limitation: "Nix queries may open, create, or migrate store metadata; requisites are a dynamic query, not deletion authorization or a byte guarantee, and host/version/store scope remains unchecked",
+    })
+}
+
 fn create_plan_at(
     r: &mut impl NixRunner,
     config: &Config,
@@ -289,21 +344,7 @@ fn create_plan_at(
     inputs: Vec<PathBuf>,
     endpoint: &str,
 ) -> Result<NixStoreActionPlan, NixError> {
-    if inputs.is_empty() || inputs.len() > MAX_INPUTS {
-        return Err(NixError::UnsafePath);
-    }
-    if inputs.iter().any(|p| {
-        !p.is_absolute()
-            || p.components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-    }) || inputs
-        .iter()
-        .map(|p| p.parent())
-        .any(|p| p.is_none() || p != inputs[0].parent())
-        || inputs.iter().collect::<BTreeSet<_>>().len() != inputs.len()
-    {
-        return Err(NixError::UnsafePath);
-    }
+    validate_inputs(&inputs)?;
     gate(config, profile, &inputs)?;
     let id = identity(r, endpoint)?;
     for p in &inputs {
@@ -717,5 +758,140 @@ mod tests {
             revalidate(&mut r, &c, CleanupProfile::Normal, &plan).unwrap_err(),
             NixError::UnsafePath
         );
+    }
+
+    #[test]
+    fn changed_store_identity_is_stale_and_still_never_deletes() {
+        let (_t, store, path) = fixture();
+        let mut runner = Mock {
+            dir: store.clone(),
+            version: "v",
+            queries: VecDeque::from([format!("{}\n", path.display()).into_bytes()]),
+            deletes: vec![],
+            delete_succeeds: true,
+            remove_on_delete: vec![],
+        };
+        let config = cfg("/not-present");
+        let plan = create_plan(&mut runner, &config, CleanupProfile::Normal, vec![path]).unwrap();
+        let replacement_store = store.parent().unwrap().join("replacement-store");
+        fs::create_dir(&replacement_store).unwrap();
+        runner.dir = replacement_store;
+
+        assert_eq!(
+            revalidate(&mut runner, &config, CleanupProfile::Normal, &plan).unwrap_err(),
+            NixError::Stale
+        );
+        assert!(runner.deletes.is_empty());
+    }
+
+    #[test]
+    fn inspection_is_ordered_non_authorizing_and_never_deletes() {
+        let (_t, d, p) = fixture();
+        let second = d.join("def-object");
+        fs::write(&second, b"fixture").unwrap();
+        let mut r = Mock {
+            dir: d,
+            version: "v",
+            queries: VecDeque::from([format!(
+                "{}\n{}\n{}\n",
+                second.display(),
+                p.display(),
+                second.display()
+            )
+            .into_bytes()]),
+            deletes: vec![],
+            delete_succeeds: true,
+            remove_on_delete: vec![],
+        };
+        let report = inspect(
+            &mut r,
+            &cfg("/not-present"),
+            CleanupProfile::Normal,
+            vec![p.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(report.selected_objects.as_slice(), std::slice::from_ref(&p));
+        assert_eq!(report.requisites, [p, second]);
+        assert_eq!(
+            report.authorization,
+            crate::nix_inspection::InspectionAuthorization::NotAuthorized
+        );
+        assert_eq!(
+            report.host_scope,
+            crate::nix_inspection::InspectionStatus::Unchecked
+        );
+        assert_eq!(
+            report.version_scope,
+            crate::nix_inspection::InspectionStatus::Unchecked
+        );
+        assert_eq!(
+            report.store_scope,
+            crate::nix_inspection::InspectionStatus::Unchecked
+        );
+        assert_eq!(
+            report.reclaimed_bytes,
+            crate::nix_inspection::InspectionStatus::Unchecked
+        );
+        assert!(r.deletes.is_empty());
+    }
+
+    #[test]
+    fn inspection_fails_closed_when_disabled_protected_or_query_fails() {
+        let (_t, d, p) = fixture();
+        let mut disabled = Mock {
+            dir: d.clone(),
+            version: "v",
+            queries: VecDeque::new(),
+            deletes: vec![],
+            delete_succeeds: true,
+            remove_on_delete: vec![],
+        };
+        let off = Config::from_toml("schema_version=2\ndefault_profile='normal'\n[profiles.low]\ncategories=[]\n[profiles.normal]\ncategories=[]\n[profiles.aggressive]\ncategories=[]").unwrap();
+        assert_eq!(
+            inspect(&mut disabled, &off, CleanupProfile::Normal, vec![p.clone()]).unwrap_err(),
+            NixError::Disabled
+        );
+        assert!(disabled.deletes.is_empty());
+
+        let mut protected = Mock {
+            dir: d.clone(),
+            version: "v",
+            queries: VecDeque::new(),
+            deletes: vec![],
+            delete_succeeds: true,
+            remove_on_delete: vec![],
+        };
+        assert_eq!(
+            inspect(
+                &mut protected,
+                &cfg(p.to_str().unwrap()),
+                CleanupProfile::Normal,
+                vec![p.clone()]
+            )
+            .unwrap_err(),
+            NixError::Protected
+        );
+        assert!(protected.deletes.is_empty());
+
+        let mut failed = Mock {
+            dir: d,
+            version: "v",
+            queries: VecDeque::new(),
+            deletes: vec![],
+            delete_succeeds: true,
+            remove_on_delete: vec![],
+        };
+        assert_eq!(
+            inspect(
+                &mut failed,
+                &cfg("/not-present"),
+                CleanupProfile::Normal,
+                vec![p]
+            )
+            .unwrap_err(),
+            NixError::Command
+        );
+        assert!(failed.deletes.is_empty());
     }
 }

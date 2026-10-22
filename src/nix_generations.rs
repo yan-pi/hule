@@ -218,6 +218,130 @@ pub fn create_plan(
     )
 }
 
+/// Reads one explicitly configured profile and classifies its current and historical generations.
+/// The result is informational and is not accepted by the apply dispatcher.
+pub fn inspect_profile(
+    runner: &mut impl GenerationRunner,
+    config: &Config,
+    cleanup_profile: CleanupProfile,
+    profile_name: &str,
+    selected_ids: &[u32],
+) -> Result<crate::nix_inspection::NixGenerationInspection, GenerationError> {
+    inspect_profile_at(
+        runner,
+        config,
+        cleanup_profile,
+        profile_name,
+        selected_ids,
+        DAEMON,
+        None,
+    )
+}
+
+fn inspect_profile_at(
+    runner: &mut impl GenerationRunner,
+    config: &Config,
+    cleanup_profile: CleanupProfile,
+    profile_name: &str,
+    selected_ids: &[u32],
+    endpoint: &str,
+    fixture_root: Option<&Path>,
+) -> Result<crate::nix_inspection::NixGenerationInspection, GenerationError> {
+    if selected_ids.len() > MAX_GENERATION_IDS {
+        return Err(GenerationError::UnsafePath);
+    }
+    let mut selected_ids = selected_ids.to_vec();
+    selected_ids.sort_unstable();
+    if selected_ids
+        .iter()
+        .any(|id| *id == 0 || *id > i32::MAX as u32)
+        || selected_ids.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return Err(GenerationError::UnsafePath);
+    }
+    let profile_config = config
+        .nix_profiles()
+        .get(profile_name)
+        .ok_or(GenerationError::UnsafePath)?;
+    let category = match profile_config.kind() {
+        NixProfileKind::User => Category::NixUserGenerations,
+        NixProfileKind::HomeManager => Category::NixHomeManagerGenerations,
+    };
+    if !config.categories(cleanup_profile).contains(&category) {
+        return Err(GenerationError::Disabled);
+    }
+    let user = current_user()?;
+    let profile_path = validate_profile_path(profile_config, &user, fixture_root)?;
+    let identity = runner.identity(endpoint)?;
+    if identity.endpoint != DAEMON
+        || identity.store_version != format!("nix-store (Nix) {SUPPORTED_VERSION}")
+        || identity.nix_env_version != format!("nix-env (Nix) {SUPPORTED_VERSION}")
+        || !identity.store_dir.is_absolute()
+        || fs::canonicalize(&identity.store_dir).map_err(|_| GenerationError::InvalidOutput)?
+            != identity.store_dir
+    {
+        return Err(GenerationError::InvalidOutput);
+    }
+    let snapshot = snapshot_profile(profile_config, profile_path, identity, &user, fixture_root)?;
+    if config.overlaps_resolved_keep_path(&snapshot.profile_path)
+        || snapshot
+            .activation_roots
+            .iter()
+            .any(|root| config.overlaps_resolved_keep_path(&root.path))
+    {
+        return Err(GenerationError::Protected);
+    }
+    let history_by_id = snapshot
+        .history
+        .iter()
+        .map(|generation| (generation.id, generation))
+        .collect::<BTreeMap<_, _>>();
+    if selected_ids
+        .iter()
+        .any(|id| *id == snapshot.current_generation || !history_by_id.contains_key(id))
+    {
+        return Err(GenerationError::UnsafePath);
+    }
+    if selected_ids.iter().any(|id| {
+        let generation = history_by_id[id];
+        config.overlaps_resolved_keep_path(&generation.link)
+            || config.overlaps_resolved_keep_path(&generation.target)
+    }) {
+        return Err(GenerationError::Protected);
+    }
+    let generations = snapshot
+        .history
+        .iter()
+        .map(|generation| crate::nix_inspection::NixGenerationEntry {
+            id: generation.id,
+            role: if generation.id == snapshot.current_generation {
+                crate::nix_inspection::GenerationRole::Current
+            } else if selected_ids.contains(&generation.id) {
+                crate::nix_inspection::GenerationRole::SelectedHistorical
+            } else {
+                crate::nix_inspection::GenerationRole::Historical
+            },
+        })
+        .collect();
+    Ok(crate::nix_inspection::NixGenerationInspection {
+        format: "hule-nix-generation-inspection",
+        schema_version: 1,
+        cleanup_profile,
+        profile_name: profile_name.to_owned(),
+        kind: profile_config.kind(),
+        current_generation: snapshot.current_generation,
+        generations,
+        selected_ids,
+        host_scope: crate::nix_inspection::InspectionStatus::Unchecked,
+        version_scope: crate::nix_inspection::InspectionStatus::Unchecked,
+        store_scope: crate::nix_inspection::InspectionStatus::Unchecked,
+        authorization: crate::nix_inspection::InspectionAuthorization::NotAuthorized,
+        history_removes_profile_links_only: true,
+        store_gc_performed: false,
+        limitation: "M2 is restricted to Nix 2.34.6; history removal affects selected profile links only, does not delete store objects or run garbage collection, and this report does not authorize cleanup",
+    })
+}
+
 fn create_plan_at(
     runner: &mut impl GenerationRunner,
     config: &Config,
@@ -1019,6 +1143,32 @@ pub mod local_test_support {
             profile_name,
             selected_ids,
             endpoint,
+            Some(fixture_root),
+        )
+    }
+
+    pub fn inspect_profile(
+        runner: &mut impl GenerationRunner,
+        config: &Config,
+        cleanup_profile: CleanupProfile,
+        profile_name: &str,
+        selected_ids: &[u32],
+        fixture_root: &Path,
+    ) -> Result<crate::nix_inspection::NixGenerationInspection, GenerationError> {
+        let endpoint = format!(
+            "local?store={}&state={}/state&log={}/log",
+            fixture_root.join("store").display(),
+            fixture_root.display(),
+            fixture_root.display()
+        );
+        checked_fixture(&endpoint, fixture_root, config)?;
+        inspect_profile_at(
+            runner,
+            config,
+            cleanup_profile,
+            profile_name,
+            selected_ids,
+            &endpoint,
             Some(fixture_root),
         )
     }

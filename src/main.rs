@@ -6,6 +6,7 @@ use hule::{
     },
     config::Config,
     docker_purge::{self, CommandDockerPurgeRunner, DockerPurgeError},
+    doctor::DoctorReport,
     nix_generations::{self, CommandGenerationRunner, GenerationError, GenerationStatus},
     nix_store::{self, CommandNixRunner},
     preset::Preset,
@@ -20,7 +21,7 @@ use std::{
     path::PathBuf,
 };
 
-const HELP: &str = "Usage:\n  hule --help\n  hule --version\n  hule config preset NAME\n  hule plan nix-store --config PATH --store-path PATH... --output PLAN [--profile low|normal|aggressive]\n  hule plan nix-generations --config PATH --nix-profile NAME --generation ID... --output PLAN [--profile low|normal|aggressive]\n  hule plan docker --docker-purge --config PATH --docker-cli /ABS/PATH/docker --docker-endpoint unix:///PATH --output PLAN [--profile low|normal|aggressive]\n  hule apply --plan PATH --config PATH [--profile low|normal|aggressive]\n  hule project register --name NAME --path PATH --mode persistent|ephemeral [--state PATH]\n  hule project list [--state PATH]\n  hule project unregister --name NAME [--state PATH]\n  hule preview rust-target --config PATH (--project NAME | --all) [--state PATH] [--profile low|normal|aggressive] [--json]\n\nFor Rust-target preview Cargo metadata (`cargo metadata --no-deps --offline --locked`) may be invoked only when each project is registered, rust_target is enabled for the selected profile, and the anticipated target is not already protected. Cargo documentation does not formally guarantee absence of all side effects or code execution. Nix store planning queries requisites for explicitly named objects and can open/create/migrate store metadata. Apply requires an interactive confirmation and uses only the saved closure with nix-store --delete --store daemon; Nix performs native liveness checks and may refuse or partially complete. Generation planning accepts only exact numeric IDs from one configured user profile; apply removes only saved noncurrent profile links through nix-env --delete-generations. Generation apply does not activate generations, delete store objects, or run GC. Native profile locking protects the generation current at the command's locked check, but does not make the saved snapshot atomic against concurrent writers. No broad GC or direct filesystem removal is performed. Docker purge planning requires an explicit --docker-purge flag, the aggressive profile with docker_purge enabled, an explicitly selected trusted Docker CLI path, and a verified local Unix socket with protected parent directories; it records executable/socket/directory identities, Engine ID, and CLI/Engine/API versions and requires API 1.42 or newer. Apply requires a typed interactive confirmation and revalidates those identities immediately before running only docker system prune --all --volumes --force. The daemon dynamically selects stopped containers, unused networks, all unused images, build cache, and unused anonymous volumes at execution; no per-resource preview or rollback is possible. Errors may follow partial mutation; Hule makes no retry and reports unknown outcome.\n";
+const HELP: &str = "Usage:\n  hule --help\n  hule --version\n  hule doctor --config PATH [--json]\n  hule inspect nix-store --config PATH --store-path PATH... [--profile low|normal|aggressive] [--json]\n  hule inspect nix-generations --config PATH --nix-profile NAME [--generation ID...] [--profile low|normal|aggressive] [--json]\n  hule config preset NAME\n  hule plan nix-store --config PATH --store-path PATH... --output PLAN [--profile low|normal|aggressive]\n  hule plan nix-generations --config PATH --nix-profile NAME --generation ID... --output PLAN [--profile low|normal|aggressive]\n  hule plan docker --docker-purge --config PATH --docker-cli /ABS/PATH/docker --docker-endpoint unix:///PATH --output PLAN [--profile low|normal|aggressive]\n  hule apply --plan PATH --config PATH [--profile low|normal|aggressive]\n  hule project register --name NAME --path PATH --mode persistent|ephemeral [--state PATH]\n  hule project list [--state PATH]\n  hule project unregister --name NAME [--state PATH]\n  hule preview rust-target --config PATH (--project NAME | --all) [--state PATH] [--profile low|normal|aggressive] [--json]\n\nFor Rust-target preview Cargo metadata (`cargo metadata --no-deps --offline --locked`) may be invoked only when each project is registered, rust_target is enabled for the selected profile, and the anticipated target is not already protected. Cargo documentation does not formally guarantee absence of all side effects or code execution. Nix inspection queries only explicitly selected store objects or a configured profile and can open/create/migrate store metadata; it does not delete or authorize cleanup. Nix store planning queries requisites for explicitly named objects and can open/create/migrate store metadata. Apply requires an interactive confirmation and uses only the saved closure with nix-store --delete --store daemon; Nix performs native liveness checks and may refuse or partially complete. Generation planning accepts only exact numeric IDs from one configured user profile; apply removes only saved noncurrent profile links through nix-env --delete-generations. Generation apply does not activate generations, delete store objects, or run GC. Native profile locking protects the generation current at the command's locked check, but does not make the saved snapshot atomic against concurrent writers. No broad GC or direct filesystem removal is performed. Docker purge planning requires an explicit --docker-purge flag, the aggressive profile with docker_purge enabled, an explicitly selected trusted Docker CLI path, and a verified local Unix socket with protected parent directories; it records executable/socket/directory identities, Engine ID, and CLI/Engine/API versions and requires API 1.42 or newer. Apply requires a typed interactive confirmation and revalidates those identities immediately before running only docker system prune --all --volumes --force. The daemon dynamically selects stopped containers, unused networks, all unused images, build cache, and unused anonymous volumes at execution; no per-resource preview or rollback is possible. Errors may follow partial mutation; Hule makes no retry and reports unknown outcome. The doctor command parses only its explicit config and reports configured categories plus static capability limitations; it does not invoke provider commands, inspect host paths, contact daemons, or authorize cleanup. Invalid/unreadable configuration is reported as unsafe without echoing its path or contents.\n";
 
 fn main() {
     if let Err(error) = run(std::env::args().skip(1).collect()) {
@@ -44,6 +45,13 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     match args.as_slice() {
         [flag] if flag == "--version" => println!("hule {}", env!("CARGO_PKG_VERSION")),
         [flag] if flag == "--help" => print!("{HELP}"),
+        [command, ..] if command == "doctor" => run_doctor(&args[1..])?,
+        [command, subcommand, ..] if command == "inspect" && subcommand == "nix-store" => {
+            run_nix_store_inspection(&args[2..])?;
+        }
+        [command, subcommand, ..] if command == "inspect" && subcommand == "nix-generations" => {
+            run_nix_generation_inspection(&args[2..])?;
+        }
         [command, subcommand, ..] if command == "plan" && subcommand == "nix-store" => {
             run_nix_plan(&args[2..])?;
         }
@@ -107,6 +115,222 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         _ => return Err("invalid arguments; use --help for usage".into()),
     }
     Ok(())
+}
+
+struct ParsedDoctorArgs {
+    config_path: PathBuf,
+    json: bool,
+}
+
+fn run_doctor(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let parsed = parse_doctor_args(args)?;
+    let report = match fs::read_to_string(parsed.config_path) {
+        Ok(contents) => Config::from_toml(&contents)
+            .map(|config| DoctorReport::from_config(&config))
+            .unwrap_or_else(|_| DoctorReport::invalid_configuration()),
+        Err(_) => DoctorReport::invalid_configuration(),
+    };
+    if parsed.json {
+        println!(
+            "{}",
+            report
+                .to_json()
+                .map_err(|_| "could not serialize doctor report")?
+        );
+    } else {
+        print!("{}", report.to_human());
+    }
+    Ok(())
+}
+
+fn parse_doctor_args(args: &[String]) -> Result<ParsedDoctorArgs, Box<dyn Error>> {
+    let mut config_path = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" if config_path.is_none() => {
+                let value = args.get(index + 1).ok_or("missing value for --config")?;
+                config_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--json" if !json => {
+                json = true;
+                index += 1;
+            }
+            _ => return Err("invalid arguments; use --help for usage".into()),
+        }
+    }
+    Ok(ParsedDoctorArgs {
+        config_path: config_path.ok_or("missing --config")?,
+        json,
+    })
+}
+
+struct ParsedNixStoreInspectionArgs {
+    config_path: PathBuf,
+    store_paths: Vec<PathBuf>,
+    profile: Option<CleanupProfile>,
+    json: bool,
+}
+
+fn run_nix_store_inspection(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let parsed = parse_nix_store_inspection_args(args)?;
+    let config = Config::from_toml(&fs::read_to_string(parsed.config_path)?)?;
+    let profile = parsed.profile.unwrap_or_else(|| config.default_profile());
+    let report = nix_store::inspect(&mut CommandNixRunner, &config, profile, parsed.store_paths)?;
+    if parsed.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|_| "could not serialize Nix store inspection")?
+        );
+    } else {
+        print!("{}", report.to_human());
+    }
+    Ok(())
+}
+
+fn parse_nix_store_inspection_args(
+    args: &[String],
+) -> Result<ParsedNixStoreInspectionArgs, Box<dyn Error>> {
+    let mut config_path = None;
+    let mut store_paths = Vec::new();
+    let mut profile = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" if config_path.is_none() => {
+                config_path = Some(PathBuf::from(
+                    args.get(index + 1).ok_or("missing value for --config")?,
+                ));
+                index += 2;
+            }
+            "--store-path" => {
+                store_paths.push(PathBuf::from(
+                    args.get(index + 1)
+                        .ok_or("missing value for --store-path")?,
+                ));
+                index += 2;
+            }
+            "--profile" if profile.is_none() => {
+                profile = Some(parse_profile(
+                    args.get(index + 1).ok_or("missing value for --profile")?,
+                )?);
+                index += 2;
+            }
+            "--json" if !json => {
+                json = true;
+                index += 1;
+            }
+            "--config" | "--profile" | "--json" => {
+                return Err("duplicate argument".into());
+            }
+            _ => return Err("invalid arguments; use --help for usage".into()),
+        }
+    }
+    if store_paths.is_empty() {
+        return Err("missing required argument: --store-path".into());
+    }
+    Ok(ParsedNixStoreInspectionArgs {
+        config_path: config_path.ok_or("missing required argument: --config")?,
+        store_paths,
+        profile,
+        json,
+    })
+}
+
+struct ParsedNixGenerationInspectionArgs {
+    config_path: PathBuf,
+    nix_profile: String,
+    generation_ids: Vec<u32>,
+    profile: Option<CleanupProfile>,
+    json: bool,
+}
+
+fn run_nix_generation_inspection(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let parsed = parse_nix_generation_inspection_args(args)?;
+    let config = Config::from_toml(&fs::read_to_string(parsed.config_path)?)?;
+    let profile = parsed.profile.unwrap_or_else(|| config.default_profile());
+    let report = nix_generations::inspect_profile(
+        &mut CommandGenerationRunner::default(),
+        &config,
+        profile,
+        &parsed.nix_profile,
+        &parsed.generation_ids,
+    )?;
+    if parsed.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|_| "could not serialize Nix generation inspection")?
+        );
+    } else {
+        print!("{}", report.to_human());
+    }
+    Ok(())
+}
+
+fn parse_nix_generation_inspection_args(
+    args: &[String],
+) -> Result<ParsedNixGenerationInspectionArgs, Box<dyn Error>> {
+    let mut config_path = None;
+    let mut nix_profile = None;
+    let mut generation_ids = Vec::new();
+    let mut profile = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" if config_path.is_none() => {
+                config_path = Some(PathBuf::from(
+                    args.get(index + 1).ok_or("missing value for --config")?,
+                ));
+                index += 2;
+            }
+            "--nix-profile" if nix_profile.is_none() => {
+                nix_profile = Some(
+                    args.get(index + 1)
+                        .ok_or("missing value for --nix-profile")?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--generation" => {
+                let id = parse_generation_id(
+                    args.get(index + 1)
+                        .ok_or("missing value for --generation")?,
+                )?;
+                if generation_ids.contains(&id) {
+                    return Err("duplicate generation id".into());
+                }
+                generation_ids.push(id);
+                index += 2;
+            }
+            "--profile" if profile.is_none() => {
+                profile = Some(parse_profile(
+                    args.get(index + 1).ok_or("missing value for --profile")?,
+                )?);
+                index += 2;
+            }
+            "--json" if !json => {
+                json = true;
+                index += 1;
+            }
+            "--config" | "--nix-profile" | "--profile" | "--json" => {
+                return Err("duplicate argument".into());
+            }
+            _ => return Err("invalid arguments; use --help for usage".into()),
+        }
+    }
+    Ok(ParsedNixGenerationInspectionArgs {
+        config_path: config_path.ok_or("missing required argument: --config")?,
+        nix_profile: nix_profile.ok_or("missing required argument: --nix-profile")?,
+        generation_ids,
+        profile,
+        json,
+    })
 }
 
 struct ParsedPreviewArgs {
